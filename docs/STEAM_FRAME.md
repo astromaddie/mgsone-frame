@@ -85,3 +85,8 @@ video and audio drivers. Turnip rendered at 1280×720, recorded 46 scene
 snapshots, and reached VBlank 16091. This covers a scripted checkpoint and
 offscreen rendering. Steam Input and the sustained in-game frame rate need
 separate checks.
+
+The private build from `721200a` was staged under `~/devkit-game/MGSOneFrame`.
+After the package checksums passed, Steam registered `Devkit Game: MGSOneFrame`
+and launched its ARM64 controller frontend. The launcher uses the verified
+retail import in `~/.local/share/mgs-recomp-frame` on this device.
