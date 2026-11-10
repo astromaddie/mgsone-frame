@@ -124,6 +124,8 @@ time and substantial memory; `BUILD_JOBS=2` reduces build parallelism.
 The dependencies under `engine/third_party` are included; no local donor
 checkout or recursive submodule clone is needed for this build.
 
+See the [Steam Frame build notes](docs/STEAM_FRAME.md) for the ARM64 baseline.
+
 ### Windows, SteamOS and portable packages
 
 Windows x64 uses the same game and renderer sources. The current build path

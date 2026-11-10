@@ -4,6 +4,16 @@ project(PS1Recomp VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(MGS_STEAM_FRAME "Build a native ARM64 Linux baseline for Steam Frame" OFF)
+if(MGS_STEAM_FRAME)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+       NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        message(FATAL_ERROR "MGS_STEAM_FRAME requires an ARM64 Linux target")
+    endif()
+    # Match the desktop build's signed char and avoid implicit fused
+    # operations in the guest runtime and the reconstructed geometry.
+    add_compile_options(-fsigned-char -ffp-contract=off)
+endif()
 if(WIN32)
     enable_language(RC)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

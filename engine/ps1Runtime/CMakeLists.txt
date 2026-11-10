@@ -358,7 +358,11 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/recompiled_out.cpp")
         list(APPEND RECOMP_SRC ${RECOMP_SHARD_SRC})
         list(LENGTH RECOMP_SHARD_SRC RECOMP_SHARD_COUNT)
         message(STATUS "Using ${RECOMP_SHARD_COUNT} generated translation shards")
+    elseif(MGS_STEAM_FRAME)
+        message(FATAL_ERROR "Steam Frame requires the generated USA v1.0 translation shards; run scripts/build_alpha.sh --steam-frame")
     endif()
+elseif(MGS_STEAM_FRAME)
+    message(FATAL_ERROR "Steam Frame requires the generated USA v1.0 game; run scripts/build_alpha.sh --steam-frame or explicitly request PS1RECOMP_USE_STUB for a source-only check")
 else()
     set(RECOMP_SRC src/recompiled_out_stub.cpp)
     message(STATUS "recompiled_out.cpp not found -- using stub (CI/test build)")
@@ -440,9 +444,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
     set_source_files_properties(${RECOMP_SRC} PROPERTIES
         COMPILE_OPTIONS "${RECOMP_COMPILE_OPTIONS}")
-    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND RECOMP_SHARD_SRC)
+    if((WIN32 OR MGS_STEAM_FRAME) AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND RECOMP_SHARD_SRC)
         # The support TU contains >19,000 unordered_map registrations in a
-        # single initializer. Inlining libc++ into it makes LLVM optimization
+        # single initializer. Inlining the standard library into it makes LLVM optimization
         # take many minutes. Keep its calls out of line; the actual game shards
         # and all handwritten runtime/renderer code retain normal optimization.
         set_source_files_properties(src/recompiled_out.cpp PROPERTIES
