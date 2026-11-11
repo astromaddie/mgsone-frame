@@ -429,12 +429,15 @@ def launch(paths, root=ROOT, reference=False, headless_frames=0, progress=print,
                  'Game started. R3 / Esc pause menu · F5 save · F9 load · F11 fullscreen')
         start=time.monotonic()
         with os.fdopen(fd,'wb') as out:
+            out.write(('MGS launch: '+('OpenXR stereo' if vr else 'flat')+'\n').encode())
+            out.flush()
             completed=run_runtime(args,cwd=root,env=env,
                 stdout=out,stderr=subprocess.STDOUT,pass_fds=(profile_lock.fileno(),))
         atomic_json(logs/'last-session.json',dict(schema=1,version=metadata(root)['version'],
           runtime_sha256=digest(runtime),returncode=completed.returncode,
           termination_signal=getattr(completed,'termination_signal',None),
           elapsed_seconds=round(time.monotonic()-start,3),headless=bool(headless_frames),
+          presentation='openxr' if vr else 'flat',
           reference_presentation=reference,log=Path(logpath).name))
         progress(f'Game closed ({completed.returncode}). Log: {logpath}')
         if getattr(completed,'termination_signal',None):

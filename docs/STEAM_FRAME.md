@@ -1,7 +1,7 @@
 # Steam Frame
 
-The Steam Frame build runs natively on ARM64 Linux and supports a flat
-launcher and an OpenXR entry point. The upstream x86-64 AppImage and Flatpak
+The Steam Frame build runs natively on ARM64 Linux and opens in OpenXR by
+default. The upstream x86-64 AppImage and Flatpak
 are separate builds. See [VR architecture](VR_ARCHITECTURE.md) for the eye
 renderer and the dock capture.
 
@@ -43,23 +43,21 @@ private build checkout. Keep the discs and those files out of Git.
 
 ## Run from Steam
 
-In the checkout on the Frame, set an initial resolution for the flat test:
+In the checkout on the Frame, the launcher keeps settings and saves in the
+shared Frame profile. To change the flat presentation resolution:
 
 ```sh
 scripts/launch_steam_frame.sh settings --height 720
 ```
 
 Add `scripts/launch_steam_frame.sh` as a Non-Steam Game and use the checkout as
-**Start In**. Use Steam Input's Gamepad layout. The first gameplay check starts
-a fresh game, reaches the dock, moves Snake, opens and closes the Codec, saves,
-and reloads.
-Check the simulation pace and Vulkan output at the dock before raising the
-resolution. A source-only build with `PS1RECOMP_USE_STUB=ON` checks the compiler
+**Start In**. With no arguments, it opens VR directly. Pass `--flat` to play
+on a flat screen, or pass a command such as `settings` for profile tools.
+A source-only build with `PS1RECOMP_USE_STUB=ON` checks the compiler
 and runtime dependencies; it cannot start the retail game.
 
-For VR, add a separate shortcut to the same script with `--vr` in its launch
-options. It opens the game directly in SteamVR and shares the flat build's
-disc import, settings and saves. The Frame D-pad and left stick move Snake.
+The explicit `--vr` option still works. VR shares the flat build's disc
+import, settings and saves. The Frame D-pad and left stick move Snake.
 The face buttons, triggers, bumpers, Menu and View map to the original
 controller using the flat build's gamepad layout. Click the right stick to
 switch between first and third person during play.

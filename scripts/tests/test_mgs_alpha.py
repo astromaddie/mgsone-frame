@@ -217,6 +217,27 @@ class AlphaTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0],str(app/'bin/mgs-runtime'))
         parsed=tomllib.loads((self.paths.data/'runtime.toml').read_text())
         self.assertTrue(Path(parsed['disc']['exe_path']).is_file())
+        session=json.loads((self.paths.data/'logs/last-session.json').read_text())
+        self.assertEqual(session['presentation'],'flat')
+        with patch.object(alpha,'run_runtime',return_value=subprocess.CompletedProcess([],0)) as run:
+            log=alpha.launch(self.paths,app,vr=True,progress=lambda _:None)
+        self.assertEqual(run.call_args.args[0][-1],'--vr')
+        self.assertEqual(json.loads((self.paths.data/'logs/last-session.json').read_text())['presentation'],'openxr')
+        self.assertEqual(log.read_text(),'MGS launch: OpenXR stereo\n')
+
+    def test_frame_library_entry_defaults_to_vr_and_keeps_explicit_flat_tools(self):
+        tools=self.base/'tools';tools.mkdir()
+        python=tools/'python3'
+        python.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        python.chmod(0o755)
+        env=dict(os.environ,PATH=str(tools)+os.pathsep+os.environ['PATH'],XDG_DATA_HOME=str(self.base))
+        launcher=alpha.ROOT/'scripts/launch_steam_frame.sh'
+        def args(*values):
+            return subprocess.check_output(['bash',str(launcher),*values],env=env,text=True).splitlines()[3:]
+        self.assertEqual(args(),['run','--vr'])
+        self.assertEqual(args('--vr'),['run','--vr'])
+        self.assertEqual(args('--flat'),['--big-picture','run'])
+        self.assertEqual(args('settings','--height','720'),['--big-picture','settings','--height','720'])
 
     def test_package_audit_rejects_unlisted_private_payload_and_modified_files(self):
         folder=self.base/'package';folder.mkdir();(folder/'readme.txt').write_text('package')
