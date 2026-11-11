@@ -509,6 +509,9 @@ struct OriginalMeshGeometry {
   std::array<uint64_t, 4> temporalIdentity{};
   std::array<float, 16> temporalCamera{};
   uint32_t temporalFrame = 0;
+  // Stereo-only rigid owner per original corner, including KMD seams and
+  // authenticated same-sample attachments. No guest pointers are dereferenced.
+  std::array<uint32_t, 4> vrPoseOwners{};
   uint32_t textureId = ~0u; // live logical KMD material ID, for PCX provenance
   bool sourceRecovery =
       false; // host-only draw without a native GP0 counterpart
@@ -737,6 +740,13 @@ struct DisplayLatchState {
   bool operator==(const DisplayLatchState &) const = default;
 };
 
+struct MgsArmPose {
+  // Shoulder, elbow, wrist. Captured from the authenticated Snake hierarchy.
+  std::array<uint32_t, 3> owners{};
+  std::array<std::array<float, 16>, 3> world{};
+  bool operator==(const MgsArmPose &) const = default;
+};
+
 struct MgsPlayerView {
   uint64_t sceneEpoch = 0;
   uint64_t bodyLifetime = 0;
@@ -744,6 +754,7 @@ struct MgsPlayerView {
   std::array<float, 16> sourceView{};
   uint16_t yaw = 0;
   uint16_t padOrigin = 0;
+  std::array<MgsArmPose, 2> arms{}; // right, left; empty during authored actions
   bool operator==(const MgsPlayerView &) const = default;
 };
 

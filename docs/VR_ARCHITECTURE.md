@@ -17,7 +17,7 @@ View press sends native Select/Codec on release, using a 50 ms pulse across
 the guest's 60 Hz input latch. A long hold sends no Select. Losing focus cancels
 a pending hold or pulse and requires release before another press.
 
-## Draw inventory to verify at the dock
+## Draw Inventory to Verify at the Dock
 
 | Source | Flat behavior | Stereo rule to verify |
 | --- | --- | --- |
@@ -63,8 +63,49 @@ IPD. A scene epoch change places a new toybox; moving the player does not.
 In first person the eye follows an offset within the native head model's
 rendered pose. Torso,
 legs, arms and hands remain visible. Only head-model faces within 180 game
-units of the eye are suppressed. The native hands follow Snake's animation;
-there is no controller-driven arm IK in this change.
+units of the eye are suppressed. I capture the shoulder, elbow and wrist
+matrices from the authenticated 16-model Snake hierarchy alongside the camera.
+Both controller grip poses are located at the eyes' predicted display time.
+A two-bone solve keeps the native segment lengths and clamps unreachable
+wrists just inside full extension. A transported elbow pole keeps wrist roll
+from flipping the arm. Original KMD seam corners keep their own rigid owner,
+and authenticated attached pieces inherit the same wrist delta.
+
+I update only the affected vertices once per display frame, before either eye.
+The guest matrices, native packet oracle and third-person toybox stay on the
+original animation. Tracking acquisition and loss blend rigid segment rotations
+over 120 ms, rebuilding the elbow and wrist from the native segment lengths.
+That returns both the elbow plane and mesh orientation to the exact native
+pose, including a straight arm. Losing focus, changing context or recentering
+resets the solve. Focus loss clears the atomic weapon handoff before the
+standby early return, even when no presentation frame follows. Wall presses, damage,
+ladders and other authored handlers retain their native arms.
+
+The renderer publishes the solved wrist through an atomic host snapshot. At
+an authenticated NewBullet call, I recover that weapon's local shot transform
+from the current native wrist, then apply it to the solved wrist. That keeps
+the rendered gun and shot on the same rigid transform without guessed muzzle
+offsets. The original constructor still owns ammunition, hit tests and damage.
+
+Before moving a shot, I query the native segment from its original start to
+the proposed start. A verified vertical wall constrains only the wall-normal
+component, keeping the hand's tangent coordinates. Its near-side inset ramps
+from one native coordinate unit to 20 as penetration increases. Floors and
+unverified wall records keep the segment clamp with its 20-unit inset. I
+recheck the segment after applying arm reach limits.
+An invalid query or failed recheck retains both the native gun and native shot.
+The guest control hook refreshes the constraint after a weapon's local muzzle
+offset has been authenticated, so moving clear does not require another shot.
+Weapon changes discard the cached offset. The first shot always checks its
+actual retail matrix again.
+
+The USA SOCOM laser helper at `0x80067728` identifies
+`HZD_OnlineHazardCheck` at `0x80029974` by its complete call sequence and retail
+instructions. I check its entry words before dispatch. The extra query uses
+all four hazard classes and skips no segment attributes. It runs on a copied
+CPU/GTE context with callbacks blocked, and restores a 2 KB temporary stack,
+the full 1 KB scratchpad, and the hazard iterator cursor at `GP + 0x81c`,
+including precision metadata. No renderer or VBlank path writes actor RAM.
 
 Forward/back/strafe follow the headset's horizontal heading. Right-stick
 turning adds up to 90°/s. The rotated analog input still enters the original
@@ -83,10 +124,11 @@ instructions. USA addresses differ from the symbolic addresses in the
 The actual boundaries are 0x8005CAB4 (animation callbacks) and 0x80026FA4
 (GM_ActControl), restricted to the Snake call returning to 0x8005D0FC.
 
-The right controller's OpenXR aim pose supplies weapon facing and pitch
-during a shot. A fingerprinted entry hook also adjusts the local matrix passed by
-the player weapon actors to the original NewBullet constructor. It preserves
-the muzzle position and the original firing, ammunition and collision code.
+The right controller's OpenXR aim pose still supplies pointing and the native
+weapon stance. With arm tracking active, the rendered grip-driven gun supplies
+the shot transform through the fingerprinted NewBullet boundary described
+above. Without tracked arms, the previous direction-only hook preserves the
+native muzzle and the original firing, ammunition and collision code.
 The three resident player call sites cover SOCOM, FAMAS and rifle bullets.
 The right trigger uses the game's Square action, and the right grip uses
 R2 for the weapon menu. A short controller ray and level projected marker show the tracked aim.
@@ -231,8 +273,10 @@ focus reset, Select pulses through 60 Hz guest latches at 72/90/120 Hz, heading
 preservation on recentre, native-step redirection without position writes,
 and byte-exact no-op behavior in third person and authored states. It also
 exercises the actual player-view producer with authenticated wall callbacks
-and a rotated presentation head pose. All 14 tests passed on the Frame.
-The runtime suite passed 1,366 tests with 32 optional skips; the controller
+and a rotated presentation head pose. The camera/control baseline passed
+14 tests on the Frame; the target now has 26 tests, including the arm and
+contact checks below. That baseline runtime suite passed 1,366 tests with
+32 optional skips; the controller
 suite passed 25. The native generator's eight synthetic checks and four
 bridge checks also passed, including the verified USA executable/overlays.
 
@@ -362,3 +406,209 @@ Use `PS1_VR_HEADLESS_AIM_YAW=1.57079632679`,
 and a fresh `PS1_TRACE_JSONL` path. A pass contains a retail shot event with
 positive X and Y direction, near-zero Z, plus a visible marker in both eyes.
 These diagnostic pose inputs are read only by `--vr-headless`.
+
+## Arm IK Checks
+
+The focused host target is `mgsVr_tests`. `MgsVrArms.*` checks native segment
+lengths under crossed, extended, raised, lowered and rolled targets; continuous
+elbow motion; tracking loss; invalid input; recenter/camera coordinates; rigid
+attachments; and the production corner transform used for KMD seams.
+`MgsVrMovement.ArmCaptureAuthenticatesHierarchyAndLeavesGuestMemoryAlone`
+checks the producer's hierarchy and authored-action gate without guest writes.
+`MgsVrMovement.NativeShotUsesWristAndRestoresHazardWorkRegions` exercises the
+production bridge, with a dispatcher test hook for clear, clamped and failed
+native queries. It checks matrix placement, CPU/GTE, scratch/stack/cursor
+restoration, entry rejection and clearing an obstruction without another shot.
+This test hook does not prove the retail hazard routine; the saved-game run
+must exercise that routine as well. All 26 focused VR tests passed on the Frame.
+The retail hazard and rendered arm checks are separate from that result.
+
+For the existing offscreen stereo capture command, add
+`PS1_VR_DIAG_HANDS=forward` and `PS1_VR_FIRST_PERSON=1`. The other hand cases are
+`crossed`, `up`, `down`, `extended`, `rolled` and `lost`. This input is accepted
+only by the offscreen path. Optional `PS1_VR_DIAG_HAND_YAW/PITCH` values
+set both grip orientations in radians, using absolute game yaw and upward
+pitch. Optional `PS1_VR_DIAG_RIGHT_X/Y/Z` values override individual right-grip
+tracking coordinates in metres (+X right, +Y up, -Z forward). Invalid and
+nonfinite values are ignored. It drives the production solver and vertex update,
+not a separate proxy mesh. `arms.txt` records native and solved joints, owner
+addresses, weights and the affected vertex count. The existing body geometry
+dump uses the solved positions as well. Compare the same saved game and latch
+with the variable unset for the native-animation baseline.
+
+The fade regression is
+`MgsVrArms.TrackingFadeKeepsBentJointsAndVerticesContinuousThroughNativeReturn`.
+It transports a bent arm around the shoulder at 72, 90 and 120 Hz, then
+measures joint and production vertex-delta steps through the final return to
+native. The same input also covers a straight native arm. Its `[arm-fade]`
+lines report maximum and final joint/vertex steps in game units.
+`MgsVrArms.StraightNativeArmHasNoResidualBendAsTrackingWeightVanishes` checks
+the small-weight limit and prints `[arm-fade-limit]` errors. Run these unchanged
+against the previous solver and the correction for the before/after result.
+
+The compiled production-header comparison measured final bent-arm elbow steps
+at 72/90/120 Hz of 318.37/317.368/317.45 mm before the correction and
+35.8323/35.8323/13.9196 mm after it. The corrected run had no segment-length
+or continuity-bound violations, compared with 23/26/39 before. At a tracking
+weight of 0.0001, elbow error fell from 30.0098 to 0.0241655 mm and wrist
+error from 3.00041 to 0.069977 mm. The test inputs and acceptance bounds live
+in those two unchanged regression cases. Repeat them with:
+
+```sh
+./mgsVr_tests --gtest_filter='MgsVrArms.*'
+```
+
+## Heliport HUD Check
+
+I reproduced the s01a/story18 Slot 1 plate at VBlank 1626. The native scanout
+was normal. All 88 tiles came from the authenticated Panorama actor0x173480,
+so I exclude that surface from the VR HUD. I keep the radar's small rectangle
+on the HUD. Full-page untextured blends now cover each eye in packet order,
+including fadeio.c's subtractive TILE. These dedicated pipelines keep the four
+native blend operators; the renderer still blends in linear colour space.
+Textured STP, other world translucency and native/cinema output keep their
+existing paths.
+
+`MgsVrView.CapturedHeliportFadeCoversEyesButRadarStaysOnHud` covers both draw
+pages and the captured fade/radar geometry. `MgsVrView.EyeOverlayPipelineRetainsNativeBlendOperators`
+checks the blend configuration used by those pipelines. The source-mesh test
+`MgsSourceMeshTest.PanoramaOwnsAffineProjectionAndCompleteTileDomain` checks
+HUD rejection after the production sphere actor binder authenticates the tile.
+The same Slot 1 checkpoint rendered at VBlanks 1626 and 1686 on Turnip.
+Both captures rejected 88 panorama tiles and retained 3,183 source/world
+faces, the native scene and the radar. The eye-wide fade count was one at
+1626 and zero at 1686. The centre plate was gone in both. Before the fix,
+all 79,200 pixels in the centre ROI (X=160..489, Y=270..509 of the 768-pixel
+eye) were RGB (10,11,17); neither corrected capture contained that uniform
+plate colour there. Most of that region is now the heliport's black sky.
+The source-mesh production regression also passed on the Frame.
+
+To repeat, load a copy of the native s01a/story18 save in an isolated profile,
+wait for control, and checkpoint at VBlank 1566. Restore that checkpoint with
+`PS1_VR_FIRST_PERSON=0` and `PS1_VR_CAPTURE_VBLANK=1626`, then repeat at 1686.
+Use the ordinary `--vr-headless` capture and a native scanout capture of the
+same latch. Check the panorama/overlay counts, the visible radar and absence
+of the centre rectangle. Keep the original memory cards unchanged.
+
+`arms.txt` now also records the actual mapped vertex-buffer count, mismatches
+and CPU/submitted hashes. The per-display arm solve updates that buffer after
+the native scene upload. A pass has zero mismatches and equal hashes; compare
+rendered hand and weapon positions across synthetic hand poses as well.
+
+The Frame dock captures at VBlank 16060 used forward and crossed grip poses
+against the same checkpoint. Both submitted 624 arm vertices with zero
+CPU/mapped-buffer mismatches and equal hashes. The rendered native forearms
+and hands moved with those poses; torso geometry and radar stayed visible.
+Coincident eyes matched byte for byte. Forward eye separation changed 41.0%
+of RGB channels by more than 6/255, and crossed poses changed 48.8%. Comparing
+the two left-eye poses changed 6.2% of channels above that threshold. These
+are offscreen production captures, separate from physical controller input.
+
+## Firearm Firing Action
+
+The VBlank 16082 trace exposed a gap in the original movement-only arm gate:
+Snake's callback was `0x800599AC` with `PLAYER_ATTACK` (`0x800`), so capture cleared the
+hand sample before NewBullet. I matched that USA callback in generated
+part048 and the retail EXE to
+[`sna_anim_shoot_weapon_helper_80057590`](https://github.com/FoxdieTeam/mgs_reversing/blob/217509eae471629b1a53633b816c61adfef9ed5c/source/chara/snake/sna_init.c).
+The match uses the attack check, idle/setup branches, padCross/table8 branch,
+A38 countdown and 256-direction threshold followed by the run-gun transition.
+The USA entry words are `27bdffd8 afb00018 00808021 24040800 afbf0020
+0c0142c1 afb1001c 1440000b` in the same SHA-256 `3342f75717c5134aec832547691c2354e67a253abfcfa9e0e823e2133bb1fc32` USA image used for HZD.
+
+I admit this callback for SOCOM weapon 0 and FAMAS weapon 1, with all eight
+entry words checked in both paths. This includes its normal exit: ATTACK
+clears before the same callback resets the action and starts idle. I keep the
+published wrist and learned muzzle offset through that interval. Pause,
+authored status, tracking and context resets still invalidate them. The pinned weapon
+factory table gives both the same gun state function and shoot-action setup.
+The arm producer and weapon bridge share that predicate. Locomotion keeps its
+old allowlist; the control hook can refresh the muzzle constraint without
+changing native movement in this action. Other weapons and unverified
+callbacks keep their native behavior.
+
+`MgsVrMovement.RetailFirearmFiringKeepsTrackedArmsAndShotWithoutOverridingMovement`
+uses the captured control `0x8016CA80`, body `0x8016D4D0`, handler and status through
+production skeletal capture and the NewBullet bridge. It also checks wall,
+unverified-handler, non-playable, grenade and corrupted-entry rejection. A
+continuous firing, attack-cleared, idle sequence checks that a learned muzzle
+offset still clamps and rechecks the wall, then recovers clear without another
+shot. The FAMAS case uses
+the same handler and its authenticated NewBullet caller `0x800682D8`.
+The dispatcher remains a test hook here; the retail clear/blocked shot capture
+is still the native hazard acceptance check. `mgs.vr.bullet_boundary` now
+reports `weapon_gate` separately from the unchanged `snake_gate` movement gate.
+
+
+The corrected ARM64 runtime is SHA-256
+`818a038d404647e50b542c9161b19bfbb2538dc1405c137c3938d2bb2b6a8a8f`.
+All 26 focused VR tests passed on the Frame. Native SOCOM and FAMAS shots
+used the tracked wrist, with Q12 direction (3969,1013,0) for supplied yaw
+pi/2 and pitch 0.25. The real hazard routine detected the wall and accepted
+the shortened muzzle after a second, clear segment check. Every saved query
+reported restored work regions and CPU context. SOCOM submitted 744 arm
+vertices and FAMAS 834, with no CPU/mapped-buffer differences.
+
+The stationary SOCOM run fired once at VBlank 16082. After the normal-exit
+correction, 25 clamped muzzle updates continued through VBlank 16129; before
+it, they stopped at 16091. The VBlank 16130 render keeps the right hand and
+gun on the near side of the rock. A neutral right-grip X=0 run supplied a
+clear native shot and 13 unclamped updates, all restored successfully.
+
+
+## Wall Contact Continuity
+
+The original segment clamp pulled along the line from the animated native
+muzzle to the controller target. During back-away movement, its added
+correction reached 74.75 mm, including 65.51 mm along the wall. Comparing
+accepted minus requested positions cancels camera/body translation; the
+163.69 mm world-position step also contained 123.69 mm of requested movement.
+
+I matched the USA wall-hit store in `TestSegment` at `0x80028F9C` and the
+floor-hit mask at `0x8002990C`. The former retains a KSEG0 `HZD_SEG` pointer
+at scratchpad offset `0x64`; the latter clears bit 31. A valid wall record has
+two `{x,z,y,height}` endpoints. I derive its vertical plane, orient its normal
+toward the original muzzle, and project only along that normal. The inset
+ramps at contact to avoid adding a sudden 20 mm displacement. The native
+reach solve and final hazard query still decide whether I can use the pose.
+Invalid, degenerate and floor-tagged records keep the previous fallback.
+
+`MgsVrMovement.WallContactPreservesTangentAndCrossesContinuously` replays all
+14 captured requests through the production bridge after one learned shot.
+Its Frame result was 0.00101 mm maximum tangent error and 0.50012 mm maximum
+step during a dense 0.25 mm approach/release, below the 1.25 mm bound. It also
+checks the safe side, native recheck and floor-tag fallback.
+
+I repeated the native recovery command with the same dock fixture and inputs:
+
+```sh
+printf '16005 16010 start\n16015 16020 square\n' > "$capture/input.txt"
+# Use the isolated SOCOM savestate/profile prepared above.
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+PS1_AUTOLOAD_VBLANK=1 PS1_EXIT_AFTER_LOAD_VBLANKS=180 \
+PS1_DIAGNOSTIC_SAVESTATE_DIR="$profile/savestates" \
+PS1_INPUT_SCRIPT="$capture/input.txt" PS1_VBLANK_PERIOD_US=16667 \
+PS1_MGS_MESH_REPLAY=1 PS1_MGS_ASSET_CACHE="$media/assets.mgsc" \
+PS1_VULKAN_HEADLESS_SURFACE=1 PS1_VULKAN_REQUIRE_HARDWARE=1 \
+PS1_VR_FIRST_PERSON=1 PS1_VR_DIAG_HANDS=forward PS1_VR_DIAG_RIGHT_X=0.25 \
+PS1_VR_DIAG_HAND_YAW=1.57079632679 PS1_VR_DIAG_HAND_PITCH=0.25 \
+PS1_VR_HEADLESS_AIM_YAW=1.57079632679 PS1_VR_HEADLESS_AIM_PITCH=0.25 \
+PS1_VR_HEADLESS_MOVE_YAW=0 PS1_VR_HEADLESS_MOVE_X=0 PS1_VR_HEADLESS_MOVE_Y=-1 \
+PS1_VR_CAPTURE_VBLANK=16060 PS1_DIAGNOSTIC_IGNORE_INPUT=0 \
+PS1_TRACE_EVENTS=mgs.vr.bullet_boundary,mgs.vr.muzzle_segment,mgs.vr.muzzle_resolved,mgs.vr.tracked_shot \
+PS1_TRACE_JSONL="$capture/trace.jsonl" \
+build/ps1Runtime/ps1Runtime --config "$profile/runtime.toml" --vr-headless "$capture"
+```
+
+The runtime's existing movement diagnostic begins at VBlank 16028. This run
+fired one tracked SOCOM shot, used eight wall contacts with normal Q12
+(0,0,-4096), and finished unclamped after backing away. Ammo went from 12 to
+11; every native query restored its work regions and CPU context. The 12
+resolved samples had zero tangent correction, compared with 65.51 mm before.
+The capture submitted 744 arm vertices with zero mapped-buffer mismatches.
+Coincident eyes matched exactly; separated eyes differed in 43.4% of RGB
+channels at a 6/255 threshold. The source renderer retained all 276 body faces.
+
+For the final broad runtime gate, run `ps1Runtime_tests` once on the Frame
+from this same build, after committing the verified source. A pass has no
+failures; optional backend/data-dependent checks report their own skips.

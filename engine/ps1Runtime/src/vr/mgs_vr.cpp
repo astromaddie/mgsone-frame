@@ -2,6 +2,7 @@
 
 #include "xr_vulkan.h"
 #include "scene_view.h"
+#include "arm_ik.h"
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_profile.h"
 #include "runtime/games/mgs_vr_input.h"
@@ -100,7 +101,7 @@ struct PlayerCamera {
   }
 };
 
-Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane) {
+Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane, const Vec3 *posedNormal = nullptr, const Vec3 *posedPosition = nullptr) {
   const auto &v = packet.vertices[lane];
   Vec3 color{float(v.color.r), float(v.color.g), float(v.color.b)};
   if (packet.rawTexture && packet.textured)
@@ -108,7 +109,7 @@ Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane) {
   else if (packet.originalMesh && packet.originalMesh->lighting.ambient[3] != 0) {
     const auto &light = packet.originalMesh->lighting;
     const auto &n = light.normals[lane];
-    Vec3 normal{n[0], n[1], n[2]};
+    Vec3 normal = posedNormal ? *posedNormal : Vec3{n[0], n[1], n[2]};
     const float length = std::sqrt(dot(normal, normal));
     if (length > 1e-6f)
       for (auto &x : normal) x /= length;
@@ -120,7 +121,8 @@ Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane) {
     for (unsigned i = 0; i < 3; ++i)
       color[i] = light.ambient[i] +
           dot(incidence, {light.colors[i][0], light.colors[i][1], light.colors[i][2]});
-    const auto &position = light.positions[lane];
+    const auto &sourcePosition = light.positions[lane];
+    const Vec3 position = posedPosition ? *posedPosition : Vec3{sourcePosition[0],sourcePosition[1],sourcePosition[2]};
     for (const auto &point : light.pointLights) {
       const auto &p = point.positionRadius;
       const auto &e = point.colorExtent;
@@ -138,39 +140,9 @@ Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane) {
   return color;
 }
 
-bool meshPosition(std::span<const uint8_t> bytes,
-                  const replay::OriginalMeshGeometry &mesh,
-                  unsigned lane, Vec3 &out) {
-  Vec3 eye{};
-  for (unsigned corner = 0; corner < 4; ++corner) {
-    const float weight = mesh.weights[lane][corner];
-    if (weight == 0) continue;
-    const uint32_t reference = mesh.pointBytes[corner];
-    const bool packed = reference >> 31;
-    const size_t offset = reference & 0x7fffffffu;
-    if (offset > bytes.size() || bytes.size() - offset < (packed ? 6u : 12u))
-      return false;
-    Vec3 point{};
-    for (unsigned axis = 0; axis < 3; ++axis) {
-      if (packed) {
-        int16_t value;
-        std::memcpy(&value, bytes.data() + offset + axis * 2, 2);
-        point[axis] = value;
-      } else {
-        std::memcpy(&point[axis], bytes.data() + offset + axis * 4, 4);
-      }
-    }
-    for (unsigned row = 0; row < 3; ++row) {
-      const auto &r = mesh.viewRows[corner * 3 + row];
-      eye[row] += weight * (dot(point, {r[0], r[1], r[2]}) + r[3]);
-    }
-  }
-  eye[0] /= games::mgs::widescreen16x9() ? 0.75f : 1.0f;
-  eye[1] /= 58.0f / 64.0f;
-  const auto world = worldFromView(mesh.temporalCamera, eye);
-  if (!world) return false;
-  out = *world;
-  return std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); });
+bool meshPosition(std::span<const uint8_t> bytes, const replay::OriginalMeshGeometry &mesh,
+                  unsigned lane, Vec3 &out, const std::map<uint32_t, Matrix> *changes = nullptr) {
+  return sourceMeshPosition(bytes,mesh,lane,out,games::mgs::widescreen16x9(),changes);
 }
 
 Material materialFor(const replay::DrawPacket &packet) {
@@ -238,6 +210,10 @@ struct FramePad {
   XrAction turnStick = XR_NULL_HANDLE, aim = XR_NULL_HANDLE;
   XrAction weaponMenu = XR_NULL_HANDLE;
   XrSpace aimSpace = XR_NULL_HANDLE;
+  std::array<XrAction, 2> handActions{};
+  std::array<XrSpace, 2> handSpaces{};
+  std::array<XrPosef, 2> handPoses{};
+  std::array<bool, 2> handsValid{};
   XrVector2f move{};
   float turn = 0;
   float grip = 0;
@@ -248,6 +224,7 @@ struct FramePad {
 
   ~FramePad() {
     if (aimSpace) xrDestroySpace(aimSpace);
+    for (auto hand : handSpaces) if (hand) xrDestroySpace(hand);
     if (set) xrDestroyActionSet(set);
   }
 
@@ -274,7 +251,7 @@ struct FramePad {
       xrCheck(xrCreateAction(set, &info, &value), "Create MGS pad action");
       return value;
     };
-    std::array<XrActionSuggestedBinding, std::size(padBindings) + 4> bindings{};
+    std::array<XrActionSuggestedBinding, std::size(padBindings) + 6> bindings{};
     for (size_t i = 0; i < buttons.size(); ++i) {
       const auto &item = padBindings[i];
       buttons[i] = action(XR_ACTION_TYPE_BOOLEAN_INPUT, item.name, item.label);
@@ -288,6 +265,10 @@ struct FramePad {
     bindings[buttons.size() + 1] = {turnStick, path("/user/hand/right/input/thumbstick")};
     bindings[buttons.size() + 2] = {aim, path("/user/hand/right/input/aim/pose")};
     bindings[buttons.size() + 3] = {weaponMenu, path("/user/hand/right/input/squeeze/value")};
+    handActions[0] = action(XR_ACTION_TYPE_POSE_INPUT, "right_hand", "Right Hand");
+    handActions[1] = action(XR_ACTION_TYPE_POSE_INPUT, "left_hand", "Left Hand");
+    bindings[buttons.size() + 4] = {handActions[0], path("/user/hand/right/input/grip/pose")};
+    bindings[buttons.size() + 5] = {handActions[1], path("/user/hand/left/input/grip/pose")};
     XrInteractionProfileSuggestedBinding suggestion{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     suggestion.interactionProfile = path("/interaction_profiles/valve/frame_controller_valve");
     suggestion.countSuggestedBindings = bindings.size();
@@ -301,6 +282,10 @@ struct FramePad {
     space.action = aim;
     space.poseInActionSpace.orientation.w = 1;
     xrCheck(xrCreateActionSpace(xr.session, &space, &aimSpace), "Create right controller aim space");
+    for (unsigned side = 0; side < 2; ++side) {
+      space.action = handActions[side];
+      xrCheck(xrCreateActionSpace(xr.session, &space, &handSpaces[side]), "Create controller grip space");
+    }
     attached = true;
   }
 
@@ -310,6 +295,7 @@ struct FramePad {
     turn = 0;
     grip = 0;
     aimValid = false;
+    handsValid = {};
     if (!attached || !focused) {
       heldThroughFocus = 0xffff;
       sticksReady = false;
@@ -364,6 +350,18 @@ struct FramePad {
       aimValid = (location.locationFlags & valid) == valid;
       if (aimValid) aimPose = location.pose;
     }
+    for (unsigned side = 0; side < 2; ++side) {
+      const XrActionStateGetInfo handQuery{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, handActions[side], XR_NULL_PATH};
+      XrActionStatePose handState{XR_TYPE_ACTION_STATE_POSE};
+      xrCheck(xrGetActionStatePose(xr.session, &handQuery, &handState), "Read controller grip tracking");
+      if (!handState.isActive) continue;
+      XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+      xrCheck(xrLocateSpace(handSpaces[side], xr.space, xr.frameState.predictedDisplayTime, &location), "Locate controller grip");
+      constexpr auto valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+          XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+      handsValid[side] = (location.locationFlags & valid) == valid;
+      if (handsValid[side]) handPoses[side] = location.pose;
+    }
     if (state.isActive && sticksReady) {
       if (state.currentState.x < -0.37f) pressed |= input::BTN_LEFT;
       if (state.currentState.x > 0.37f) pressed |= input::BTN_RIGHT;
@@ -394,6 +392,10 @@ struct Renderer::Impl {
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
   VkPipeline worldPipeline = VK_NULL_HANDLE, translucentPipeline = VK_NULL_HANDLE,
              panelPipeline = VK_NULL_HANDLE;
+  std::array<VkPipeline, 4> eyeOverlayPipelines{};
+  struct EyeOverlay { uint32_t from, to; replay::BlendMode mode; };
+  std::vector<EyeOverlay> eyeOverlays;
+  uint32_t panoramaRejected = 0;
   VkFence fence = VK_NULL_HANDLE;
   Buffer nativeBuffer, vertexBuffer, materialBuffer, readback;
   VkShaderModule vertexShader = VK_NULL_HANDLE, fragmentShader = VK_NULL_HANDLE;
@@ -411,6 +413,22 @@ struct Renderer::Impl {
   GPU::DisplayState display{};
   replay::CrashReplayFramePtr worldFrame, panelFrame;
   std::optional<PlayerCamera> playerCamera;
+  struct ArmVertex { size_t index; const replay::DrawPacket *packet; unsigned lane; };
+  std::vector<ArmVertex> armVertices;
+  std::array<arm::State, 2> armState{};
+  std::array<arm::Solution, 2> armSolutions{};
+  std::map<uint32_t, Matrix> armChanges;
+  uint64_t armEpoch = 0, armLifetime = 0;
+  bool weaponPosePublished = false;
+  void clearWeaponPose() {
+    if (!weaponPosePublished) return;
+    games::mgs::setVrWeaponPose({});
+    weaponPosePublished = false;
+  }
+  void resetArms() {
+    armState = {}; armSolutions = {}; armChanges.clear();
+    clearWeaponPose();
+  }
   uint64_t revision = UINT64_MAX, builtFrame = UINT64_MAX;
   uint64_t lastWorld = 0, captureAt = 0, submitted = 0;
   uint32_t solidVertices = 0, worldVertices = 0, worldFaces = 0, bodyFaces = 0;
@@ -427,6 +445,7 @@ struct Renderer::Impl {
   ~Impl() {
     games::mgs::setVrShotDirection({});
     games::mgs::setVrMovement({});
+    games::mgs::setVrWeaponPose({});
     if (!device()) return;
     vkDeviceWaitIdle(device());
     if (cacheBound) {
@@ -441,6 +460,7 @@ struct Renderer::Impl {
       destroyImage(eye.depth);
     }
     vkDestroyFence(device(), fence, nullptr);
+    for (auto pipeline : eyeOverlayPipelines) vkDestroyPipeline(device(), pipeline, nullptr);
     vkDestroyPipeline(device(), panelPipeline, nullptr);
     vkDestroyPipeline(device(), translucentPipeline, nullptr);
     vkDestroyPipeline(device(), worldPipeline, nullptr);
@@ -458,6 +478,7 @@ struct Renderer::Impl {
   }
 
   void recenterRoom() {
+    resetArms();
     if (firstPerson && playerCamera)
       recenterFirstPerson(anchor, eyes, baseHeading, stickTurn, headTurn);
     else anchor = recenter(eyes);
@@ -638,7 +659,8 @@ struct Renderer::Impl {
     return module;
   }
 
-  VkPipeline makePipeline(bool depthTest, bool depthWrite, bool blend) {
+  VkPipeline makePipeline(bool depthTest, bool depthWrite, bool blend,
+                          std::optional<replay::BlendMode> eyeBlend = {}) {
     const VkPipelineShaderStageCreateInfo stages[]{
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
          VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "main", nullptr},
@@ -683,6 +705,15 @@ struct Renderer::Impl {
     VkPipelineColorBlendStateCreateInfo color{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     color.attachmentCount = 1;
     color.pAttachments = &attachment;
+    if (eyeBlend) {
+      const auto native = mgsEyeOverlayBlend(*eyeBlend);
+      attachment.srcColorBlendFactor = native.foreground == 1 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_CONSTANT_COLOR;
+      attachment.dstColorBlendFactor = native.background == 1 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_CONSTANT_COLOR;
+      attachment.colorBlendOp = native.subtract ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
+      attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      std::fill(std::begin(color.blendConstants), std::end(color.blendConstants), native.foreground);
+    }
     const VkDynamicState states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = 2;
@@ -772,6 +803,8 @@ struct Renderer::Impl {
     worldPipeline = makePipeline(true, true, false);
     translucentPipeline = makePipeline(true, false, true);
     panelPipeline = makePipeline(false, false, true);
+    for (unsigned i = 0; i < eyeOverlayPipelines.size(); ++i)
+      eyeOverlayPipelines[i] = makePipeline(false, false, true, replay::BlendMode(i));
     const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     vkCheck(vkCreateFence(device(), &fenceInfo, nullptr, &fence), "Create VR completion fence");
 
@@ -785,7 +818,7 @@ struct Renderer::Impl {
               << " on " << properties.deviceName << '\n';
   }
 
-  bool addPacket(const replay::DrawPacket &packet, const DisplayAperture &aperture, bool world) {
+  bool addPacket(const replay::DrawPacket &packet, const DisplayAperture &aperture, bool world, bool eyeOverlay = false) {
     if (materials.size() >= maxFaces - 4 || packet.vertexCount > 4 ||
         packet.indexCount == 0 || packet.indexCount > 6)
       return false;
@@ -798,6 +831,8 @@ struct Renderer::Impl {
         if (!meshPosition(assets->assets().bytes(), *packet.originalMesh, i, v.position))
           return false;
         v.position = playerCamera ? playerCamera->transform(v.position) : toybox.transform(v.position);
+      } else if (eyeOverlay) {
+        v.position = mgsEyeOverlayPosition(p.x, p.y, aperture.x, aperture.width, aperture.height);
       } else {
         constexpr float panelDepth = 2.0f;
         v.position = {float((p.x - aperture.x) / aperture.width - 0.5) * 1.9f,
@@ -812,7 +847,7 @@ struct Renderer::Impl {
       if (packet.triangleIndices[i] >= packet.vertexCount) return false;
     materials.push_back(materialFor(packet));
     if (offscreen()) materialSources.push_back(&packet);
-    if (!world) {
+    if (!world && !eyeOverlay) {
       const auto &area = packet.state.drawArea;
       const float left = std::max(0.0f, float(area.left) - aperture.x) / aperture.width * 1.9f - 0.95f;
       const float right = std::min(float(aperture.width), float(area.right + 1) - aperture.x) / aperture.width * 1.9f - 0.95f;
@@ -848,12 +883,154 @@ struct Renderer::Impl {
           vertices.insert(vertices.end(), {polygon[0], polygon[k], polygon[k+1]});
         }
       }
-    } else for (unsigned i = 0; i < packet.indexCount; ++i)
-      vertices.push_back(points[packet.triangleIndices[i]]);
-    // The PS1 quad strip flips the second triangle's winding.
-    if (world && packet.vertexCount == 4 && packet.indexCount == 6)
-      std::iter_swap(vertices.end() - 2, vertices.end() - 1);
+    } else for (unsigned i = 0; i < packet.indexCount; ++i) {
+      // Keep the per-corner owner through seam weighting and quad winding.
+      unsigned index = i;
+      if (world && packet.vertexCount == 4 && packet.indexCount == 6 && i >= 4) index = 9 - i;
+      const unsigned lane = packet.triangleIndices[index];
+      const auto ownedByArm = [&](uint32_t owner) {
+        if (!playerCamera || !owner || !worldFrame) return false;
+        for (const auto &arm : worldFrame->latch().mgsPlayerView->arms)
+          for (uint32_t joint : arm.owners) if (joint == owner) return true;
+        return false;
+      };
+      if (world && playerCamera && std::any_of(packet.originalMesh->vrPoseOwners.begin(),
+          packet.originalMesh->vrPoseOwners.end(), ownedByArm))
+        armVertices.push_back({vertices.size(), &packet, lane});
+      vertices.push_back(points[lane]);
+    }
     return true;
+  }
+
+  void diagnosticHands() {
+    if (!offscreen()) return;
+    const char *mode = std::getenv("PS1_VR_DIAG_HANDS");
+    if (!mode) return;
+    const auto diagnosticValue = [](const char *name) -> std::optional<float> {
+      const char *value = std::getenv(name);
+      if (!value || !*value) return {};
+      char *end = nullptr;
+      const float parsed = std::strtof(value, &end);
+      if (end == value || *end || !std::isfinite(parsed)) return {};
+      return parsed;
+    };
+    const auto handYaw = diagnosticValue("PS1_VR_DIAG_HAND_YAW");
+    const auto handPitch = diagnosticValue("PS1_VR_DIAG_HAND_PITCH");
+    const std::array<std::optional<float>, 3> rightPosition{
+        diagnosticValue("PS1_VR_DIAG_RIGHT_X"), diagnosticValue("PS1_VR_DIAG_RIGHT_Y"),
+        diagnosticValue("PS1_VR_DIAG_RIGHT_Z")};
+    for (unsigned side = 0; side < 2; ++side) {
+      const float sign = side ? -1.0f : 1.0f;
+      Vec3 p{sign*0.25f,-0.3f,-0.35f};
+      Quaternion q{0,0,0,1};
+      if (!std::strcmp(mode,"crossed")) p={-sign*0.2f,-0.2f,-0.3f};
+      if (!std::strcmp(mode,"up")) p={sign*0.2f,0.4f,-0.2f};
+      if (!std::strcmp(mode,"down")) p={sign*0.2f,-0.8f,-0.15f};
+      if (!std::strcmp(mode,"extended")) p={sign*0.25f,-0.2f,-1.4f};
+      if (!std::strcmp(mode,"rolled")) q={0,0,1,0};
+      if (handYaw || handPitch) {
+        // Same absolute game yaw / upward pitch convention as HEADLESS_AIM.
+        // Supplying either angle replaces the mode's grip orientation.
+        const float hy = (handYaw.value_or(baseHeading) - baseHeading) * 0.5f;
+        const float hp = handPitch.value_or(0) * 0.5f;
+        q = {std::cos(hy)*std::sin(hp), std::sin(hy)*std::cos(hp),
+             -std::sin(hy)*std::sin(hp), std::cos(hy)*std::cos(hp)};
+      }
+      if (side == 0)
+        for (unsigned axis = 0; axis < 3; ++axis)
+          if (rightPosition[axis]) p[axis] = *rightPosition[axis];
+      pad.handPoses[side]={{q[0],q[1],q[2],q[3]},{p[0],p[1],p[2]}};
+      pad.handsValid[side]=std::strcmp(mode,"lost") != 0;
+    }
+  }
+
+  void dumpArms() {
+    if (!offscreen() || !worldFrame || !worldFrame->latch().mgsPlayerView) return;
+    std::ofstream out(directory / "arms.txt");
+    const auto &player=*worldFrame->latch().mgsPlayerView;
+    out << "epoch " << player.sceneEpoch << " body " << player.bodyLifetime << " vertices " << armVertices.size() << '\n';
+    const auto *submitted = static_cast<const Vertex *>(vertexBuffer.mapped);
+    size_t mismatches = 0;
+    uint64_t cpuHash = 14695981039346656037ull, submittedHash = cpuHash;
+    const auto hashVertex = [](uint64_t &hash, const Vertex &v) {
+      const auto *bytes = reinterpret_cast<const uint8_t *>(&v);
+      for (size_t i = 0; i < sizeof(v); ++i) { hash ^= bytes[i]; hash *= 1099511628211ull; }
+    };
+    for (const auto &vertex : armVertices) {
+      const auto &cpu = vertices[vertex.index], &gpuVertex = submitted[vertex.index];
+      mismatches += cpu.position != gpuVertex.position || cpu.shade != gpuVertex.shade ||
+                    cpu.uv != gpuVertex.uv || cpu.material != gpuVertex.material;
+      hashVertex(cpuHash, cpu); hashVertex(submittedHash, gpuVertex);
+    }
+    out << "submitted_vertices " << armVertices.size() << " mismatches " << mismatches
+        << " cpu_hash " << cpuHash << " submitted_hash " << submittedHash << '\n';
+    for(unsigned side=0;side<2;++side) {
+      out << "side " << side << " active " << armSolutions[side].active << " weight " << armState[side].weight << '\n';
+      for(unsigned joint=0;joint<3;++joint) {
+        const auto a=arm::position(player.arms[side].world[joint]);
+        const auto b=arm::position(armSolutions[side].world[joint]);
+        out << "joint " << joint << " owner " << player.arms[side].owners[joint] << " native " << a[0] << ' ' << a[1] << ' ' << a[2]
+            << " solved " << b[0] << ' ' << b[1] << ' ' << b[2] << '\n';
+      }
+    }
+  }
+
+  void updateArms() {
+    if (!playerCamera || !worldFrame || (!offscreen() && !pad.inputFocused)) {
+      resetArms();
+    } else {
+      const auto &player = *worldFrame->latch().mgsPlayerView;
+      if (armEpoch != player.sceneEpoch || armLifetime != player.bodyLifetime) {
+        resetArms(); armEpoch = player.sceneEpoch; armLifetime = player.bodyLifetime;
+      }
+      armChanges.clear();
+      const float dt = offscreen() ? 1.0f / float(headlessHz ? headlessHz : 60) :
+          float(xr.frameState.predictedDisplayPeriod) * 1e-9f;
+      for (unsigned side = 0; side < 2; ++side) {
+        const auto &p = pad.handPoses[side];
+        const auto target = arm::controllerTarget({p.position.x,p.position.y,p.position.z},
+            {p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w},
+            anchor,baseHeading,stickTurn,player.eye,pad.handsValid[side]);
+        // Body-relative outward/downward bend, independent of controller roll.
+        const float sign = side ? 1.0f : -1.0f;
+        const Vec3 pole{sign*std::cos(baseHeading),-1.5f,-sign*std::sin(baseHeading)};
+        armSolutions[side] = arm::solve(player.arms[side],target,pole,dt,armState[side]);
+        if (side == 0) {
+          if (armSolutions[0].active) {
+            games::mgs::setVrWeaponPose({player.arms[0].owners[2],armSolutions[0].world[2],player.arms[0].world});
+            weaponPosePublished = true;
+            const auto constraint = games::mgs::vrWeaponConstraint();
+            if (constraint.nativeFallback && constraint.pose.wristOwner == player.arms[0].owners[2]) armSolutions[0] = {};
+            else if (constraint.pose.wristOwner == player.arms[0].owners[2]) {
+              arm::Target safe; safe.tracked = true; safe.wrist = constraint.pose.wristWorld;
+              auto constrained = armState[0]; constrained.weight = 1;
+              armSolutions[0] = arm::solve(player.arms[0],safe,pole,0,constrained);
+            }
+          } else clearWeaponPose();
+        }
+        if (armSolutions[side].active)
+          for (unsigned joint = 0; joint < 3; ++joint)
+            armChanges.emplace(player.arms[side].owners[joint],armSolutions[side].changes[joint]);
+      }
+    }
+    if (!playerCamera) return;
+    for (const auto &vertex : armVertices) {
+      auto &out = vertices[vertex.index];
+      const auto &mesh = *vertex.packet->originalMesh;
+      Vec3 position{};
+      if (meshPosition(assets->assets().bytes(),mesh,vertex.lane,position,&armChanges))
+        out.position = playerCamera->transform(position);
+      const auto &n = mesh.lighting.normals[vertex.lane];
+      Vec3 normal{n[0],n[1],n[2]};
+      const auto delta = armChanges.find(mesh.vrPoseOwners[vertex.lane]);
+      if (delta != armChanges.end()) normal = arm::vector(delta->second,normal);
+      out.shade = shadeVertex(*vertex.packet,vertex.lane,&normal,&position);
+      // updateScene uploaded the native snapshot before this display's solve.
+      // This coherent mapped buffer is the actual vkCmdDraw vertex source.
+      static_cast<Vertex *>(vertexBuffer.mapped)[vertex.index] = out;
+    }
+    metrics::setState("vr.arm_right",armSolutions[0].active);
+    metrics::setState("vr.arm_left",armSolutions[1].active);
   }
 
   void cinema() {
@@ -905,6 +1082,9 @@ struct Renderer::Impl {
     }
 
     vertices.clear();
+    armVertices.clear();
+    eyeOverlays.clear();
+    panoramaRejected = 0;
     materials.clear();
     materialSources.clear();
     transparent.clear();
@@ -989,7 +1169,10 @@ struct Renderer::Impl {
         if (pageX) enclosingPage = pageX;
         // Polygons used for UI often retain the generic Projected3D route,
         // with no XYZ witness. Do not discard those or partially clipped HUD.
-        if (!isMgsHudCandidate(*packet)) continue;
+        if (!isMgsHudCandidate(*packet)) {
+          if (packet->surfaceEffect.kind == replay::MgsSurfaceKind::Panorama) ++panoramaRejected;
+          continue;
+        }
         const auto &area = packet->state.drawArea;
         if (area.right < area.left || area.bottom < area.top) continue;
         // Keep the retained horizontal DRAW page, independently of the
@@ -1002,7 +1185,10 @@ struct Renderer::Impl {
         if (area.left >= int(page.x + page.width) || area.top >= int(page.height) ||
             area.right < int(page.x) || area.bottom < 0) continue;
         if (isMgsHudBackground(*packet, page.x, page.width, page.height)) continue;
-        addPacket(*packet, page, false);
+        const bool eyeOverlay = isMgsEyeOverlay(*packet, page.x, page.width, page.height);
+        const uint32_t from = vertices.size();
+        if (addPacket(*packet, page, false, eyeOverlay) && eyeOverlay)
+          eyeOverlays.push_back({from, uint32_t(vertices.size()), packet->state.blend.mode});
       }
     }
     if (panelWasWorld != (worldFaces != 0)) {
@@ -1050,7 +1236,7 @@ struct Renderer::Impl {
       ++b.faces;
       for (unsigned lane = 0; lane < packet->vertexCount; ++lane) {
         Vec3 point{};
-        if (!meshPosition(assets->assets().bytes(), mesh, lane, point)) continue;
+        if (!meshPosition(assets->assets().bytes(), mesh, lane, point, &armChanges)) continue;
         for (unsigned axis = 0; axis < 3; ++axis) {
           b.low[axis] = std::min(b.low[axis], point[axis] - player.eye[axis]);
           b.high[axis] = std::max(b.high[axis], point[axis] - player.eye[axis]);
@@ -1120,7 +1306,7 @@ struct Renderer::Impl {
       bar(0, 0.018f, 0.006f);
       bar(6, 0.006f, 0.018f);
       // A short visible ray identifies the tracked right controller as aim.
-      // Snake's native hands remain part of his body, not proxy IK hands.
+      // Pointing stays on aim/pose; held geometry follows grip/pose.
       const Vec3 side = unit(cross(direction, up));
       const auto beamPoint = [&](const Vec3 &p, float sign) {
         Vec3 v = p;
@@ -1176,7 +1362,18 @@ struct Renderer::Impl {
       const auto panelMatrix = eyeMatrix(overlayAnchor, views[i]);
       vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                          0, sizeof(panelMatrix), panelMatrix.data());
-      draw(panelPipeline, worldVertices, vertices.size());
+      uint32_t panelFrom = worldVertices;
+      const Matrix clipMatrix{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+      for (const auto &overlay : eyeOverlays) {
+        draw(panelPipeline, panelFrom, overlay.from);
+        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(clipMatrix), clipMatrix.data());
+        draw(eyeOverlayPipelines[size_t(overlay.mode)], overlay.from, overlay.to);
+        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(panelMatrix), panelMatrix.data());
+        panelFrom = overlay.to;
+      }
+      draw(panelPipeline, panelFrom, vertices.size());
       if (showAim) {
         const auto pointerMatrix = eyeMatrix(Anchor{}, views[i]);
         vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
@@ -1292,13 +1489,15 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
       focused, state.xr.frameState.predictedDisplayTime);
   sample.buttons &= ~input::BTN_SELECT;
   if (view.select) sample.buttons |= input::BTN_SELECT;
-  if (state.xr.state != XR_SESSION_STATE_FOCUSED || (state.canDraw && !state.pad.inputFocused))
-    state.wasFocused = false;
   const bool regainedFocus = focused && !state.wasFocused;
-  if (focused) state.wasFocused = true;
+  // Standby may return before present(), so invalidate the published handoff
+  // here on the transition rather than waiting for a drawable frame.
+  if (!focused && state.wasFocused) state.resetArms();
+  state.wasFocused = focused;
   const bool switchPressed = (sample.buttons & input::BTN_R3) != 0;
   if (switchPressed && !state.switchHeld) {
     state.firstPerson = !state.firstPerson;
+    state.resetArms();
     state.builtFrame = UINT64_MAX;
     state.playerEpoch = 0;
     state.playerCamera.reset();
@@ -1384,6 +1583,8 @@ void Renderer::present() {
   auto &state = *impl_;
   if (!state.offscreen() && !state.canDraw) return;
   state.updateScene();
+  state.diagnosticHands();
+  state.updateArms();
   state.logPanelPlacement();
   if (state.offscreen()) {
     if (state.headlessHz) {
@@ -1407,6 +1608,7 @@ void Renderer::present() {
     state.drawEyes(diagnosticEyes(0, 0.12f));
     state.dump("leaned");
     if (state.playerCamera) {
+      state.dumpArms();
       state.dumpBodyGeometry();
       state.drawEyes(diagnosticEyes(0, 0, -std::numbers::pi_v<float> / 3));
       state.dump("down60");
@@ -1429,10 +1631,13 @@ void Renderer::present() {
     info << "vblank=" << state.builtFrame << " world_faces=" << state.worldFaces
          << " source_faces=" << sourceFaces
          << " player_witness=" << bool(state.panelFrame && state.panelFrame->latch().mgsPlayerView)
+         << " panel_latch=" << (state.panelFrame ? state.panelFrame->latch().frameNumber : 0)
+         << " world_latch=" << (state.worldFrame ? state.worldFrame->latch().frameNumber : 0)
          << " body_faces=" << state.bodyFaces
          << " toybox_epoch=" << state.toybox.epoch
          << " toybox_centre=" << state.toybox.centre[0] << ',' << state.toybox.centre[1] << ',' << state.toybox.centre[2]
          << " vertices=" << state.vertices.size() << " panel_vertices=" << state.vertices.size()-state.worldVertices
+         << " panorama_rejected=" << state.panoramaRejected << " eye_overlays=" << state.eyeOverlays.size()
          << " source=" << scanout.sourceByteX << ',' << scanout.sourceY
          << " extent=" << scanout.activeExtent.width << ',' << scanout.activeExtent.height
          << " native_nonblack=" << nonblack << " enabled=" << scanout.enabled << '\n';
@@ -1448,10 +1653,17 @@ void Renderer::present() {
       if (page) enclosingPage = page;
       ++groups[{a.left, a.top, a.right, a.bottom, packet->state.drawOffset.x,
                 packet->state.drawOffset.y, page ? int32_t(*page) : -1}];
-      if (!isMgsHudCandidate(*packet)) continue;
+      if (!isMgsHudCandidate(*packet) && packet->surfaceEffect.kind != replay::MgsSurfaceKind::Panorama) continue;
       info << "hud_packet seq=" << packet->packetSequence << " submission=" << packet->submissionId
            << " opcode=" << unsigned(packet->opcode) << " route=" << unsigned(packet->route)
            << " xyz=" << unsigned(packet->validMask) << " textured=" << packet->textured
+           << " hud_candidate=" << isMgsHudCandidate(*packet)
+           << " semantic=" << unsigned(packet->semanticReason) << " fallback=" << unsigned(packet->fallbackReason)
+           << " surface=" << unsigned(packet->surfaceEffect.kind) << ',' << packet->surfaceEffect.actor
+           << " screen=" << unsigned(packet->screenEffect.kind) << ',' << packet->screenEffect.actor
+           << " gouraud=" << packet->gouraud << " raw_texture=" << packet->rawTexture
+           << " mask=" << packet->state.mask.forceMaskBit << ',' << packet->state.mask.checkMaskBit
+           << " vertices=" << unsigned(packet->vertexCount) << " indices=" << unsigned(packet->indexCount)
            << " blend=" << packet->state.blend.enabled << ',' << unsigned(packet->state.blend.mode)
            << " area=" << a.left << ',' << a.top << ',' << a.right << ',' << a.bottom
            << " offset=" << packet->state.drawOffset.x << ',' << packet->state.drawOffset.y
@@ -1460,6 +1672,7 @@ void Renderer::present() {
            << " tpage=" << packet->state.texturePage.raw << " clut=" << packet->state.clut.raw;
       for (unsigned lane = 0; lane < packet->vertexCount && lane < 4; ++lane) {
         const auto &v = packet->vertices[lane];
+        info << " xy" << lane << '=' << v.x << ',' << v.y << " uv" << lane << '=' << v.u << ',' << v.v;
         info << " v" << lane << '=' << v.nativeX << ',' << v.nativeY
              << ':' << unsigned(v.color.r) << ',' << unsigned(v.color.g) << ',' << unsigned(v.color.b);
       }

@@ -188,10 +188,12 @@ libm and libstdc++; Frame accepts its requirements through GLIBC 2.43,
 GLIBCXX 3.4.32, CXXABI 1.3.13 and GCC 4.5.0.
 
 I also cross-built the retail USA campaign with the native host generators.
-Its runtime SHA-256 is
-`212d5898a84cd72a3d2016ea6e83c5c400eec720794f2f7b9966704ef89640af`.
-The ELF passed the Frame sysroot check and ran its game captures on Turnip.
-The Frame passed 14 VR checks, 1,366 runtime checks with 32 optional skips,
-and 25 controller checks. [VR Architecture](VR_ARCHITECTURE.md) records the
-menu, body, wall, movement and native shot inputs and results. The final
-retail package lives in `artifacts/frame-retail` on the D-backed workspace.
+The tracked-arm and heliport HUD correction has runtime SHA-256
+`818a038d404647e50b542c9161b19bfbb2538dc1405c137c3938d2bb2b6a8a8f`.
+Its ELF passed the Frame sysroot check. The focused target passed all 26 VR
+checks, and the game captures ran on Turnip. The earlier baseline passed
+1,366 runtime checks with 32 optional skips and 25 controller checks.
+[VR Architecture](VR_ARCHITECTURE.md) records the repeatable menu, body, wall,
+movement, arm and native shot inputs and results. The final retail package
+lives at `D:\MGSOneFrameDev\artifacts\frame-retail`, accessible from WSL at
+`/mnt/d/MGSOneFrameDev/artifacts/frame-retail`.

@@ -2,6 +2,7 @@
 #include "runtime/cpu_context.h"
 #include "runtime/games/mgs_decomp.h"
 #include "runtime/games/mgs_profile.h"
+#include "runtime/games/mgs_vr_input.h"
 #include "runtime/games/mgs_scene.h"
 #include "runtime/games/mgs_surface_effects.h"
 #include "runtime/gpu/modern_replay.h"
@@ -283,10 +284,36 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   for (unsigned axis = 0; axis < 3; ++axis)
     eye[axis] = head[12 + axis] + 100.0f * head[4 + axis] + 60.0f * head[8 + axis];
   if (status & 0x40u) eye[1] += 320.0f;
-  return gpu::replay::MgsPlayerView{
+  gpu::replay::MgsPlayerView result{
       scene.epoch, instance->lifetime, eye,
       scene.view, uint16_t(memory.read16(control + 10) & 4095u),
       uint16_t(memory.read32(0x800ADAA8u) & 4095u)};
+  // Keep native authored arms, but retain tracked hands through the verified
+  // SOCOM/FAMAS firing callback. It is deliberately not a locomotion state.
+  const bool ordinary = handler == 0x80054854u || handler == 0x800549D8u ||
+      handler == 0x80054B50u || handler == 0x80054C6Cu ||
+      handler == 0x80054E80u || handler == 0x80055B6Cu ||
+      isVrFirearmAction(memory, handler, int16_t(memory.read16(0x800B752Cu)));
+  if (stereoCapture && ordinary && instance->primaryModels == 16 &&
+      instance->models.size() >= 16 && !instance->pose.invalidInput &&
+      instance->pose.source == ScenePoseSource::Rotations &&
+      range(instance->definition, 32 + 16 * 88)) {
+    for (unsigned side = 0; side < 2; ++side) {
+      gpu::replay::MgsArmPose arm;
+      int32_t joint = side ? 9 : 4;
+      bool valid = true;
+      for (int bone = 2; bone >= 0; --bone) {
+        if (joint < 0 || joint >= 16) { valid = false; break; }
+        arm.owners[bone] = instance->models[joint].guestAddress;
+        arm.world[bone] = instance->models[joint].presentationWorld;
+        const int32_t parent = int32_t(memory.read32(instance->definition + 76 + joint * 88));
+        if (bone && (parent < 0 || parent >= joint)) { valid = false; break; }
+        joint = parent;
+      }
+      if (valid) result.arms[side] = arm;
+    }
+  }
+  return result;
 }
 
 namespace {
@@ -628,6 +655,23 @@ bool buildSourceFace(const SceneSnapshot &scene, const SceneInstance &instance,
                      instance.pose.inheritedRoot;
   face.projection = scene.projection;
   bool complete = true;
+  uint32_t attachmentOwner = 0;
+  if (stereoCapture) {
+      // Follow only links whose copied native root was authenticated by the
+      // pose reconstruction. Rigid weapon pieces inherit their hand's delta.
+      uint32_t ownerAddress = 0;
+      const SceneInstance *link = &instance;
+      for (size_t depth = 0; depth < scene.instances.size() && link->pose.inheritedRoot; ++depth) {
+        const SceneInstance *parent = nullptr;
+        for (const auto &candidate : scene.instances)
+          for (uint32_t j = 0; j < candidate.primaryModels && j < candidate.models.size(); ++j)
+            if (candidate.models[j].guestAddress == link->rootAddress) parent = &candidate;
+        if (!parent) break;
+        ownerAddress = link->rootAddress;
+        link = parent;
+      }
+      attachmentOwner = ownerAddress;
+    }
   constexpr unsigned order[] = {0, 1, 3, 2};
   for (unsigned k = 0; k < 4; ++k) {
     const uint32_t corner = begin + f * 4 + order[k];
@@ -683,6 +727,7 @@ bool buildSourceFace(const SceneSnapshot &scene, const SceneInstance &instance,
       }
     }
     face.geometry.pointBytes[k] = pointByte;
+    if (stereoCapture) face.geometry.vrPoseOwners[k] = attachmentOwner ? attachmentOwner : instance.models[owners[model]].guestAddress;
     const auto &world = instance.models[owners[model]].presentationWorld;
     for (unsigned row = 0; row < 3; ++row) {
       auto &out = face.geometry.viewRows[k * 3 + row];

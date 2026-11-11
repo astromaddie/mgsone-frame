@@ -1,4 +1,5 @@
 #include "runtime/cpu_context.h"
+#include "../../ps1Runtime/src/vr/scene_view.h"
 #include "runtime/games/mgs_asset_cache.h"
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_profile.h"
@@ -1329,6 +1330,7 @@ TEST_F(MgsSourceMeshTest, PanoramaOwnsAffineProjectionAndCompleteTileDomain) {
   }
   bindSurfaceEffect(p,pack+4);
   EXPECT_EQ(p.surfaceEffect.kind,gpu::replay::MgsSurfaceKind::Panorama);
+  EXPECT_FALSE(gpu::vr::isMgsHudCandidate(p)); // authenticated sphere background, never foreground HUD
   EXPECT_EQ(p.route,gpu::replay::PacketRoute::Screen2D);
   EXPECT_EQ(p.fallbackReason,gpu::replay::PacketFallbackReason::None);
   EXPECT_DOUBLE_EQ(p.vertices[3].u,32);EXPECT_DOUBLE_EQ(p.vertices[3].v,32);

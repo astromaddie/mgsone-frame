@@ -3,6 +3,9 @@
 #include "runtime/gpu/modern_replay.h"
 #include <optional>
 #include <cstdint>
+#include <map>
+#include <cstring>
+#include <algorithm>
 
 namespace ps1::gpu::vr {
 // A live gameplay HUD shares head translation, yaw and pitch, never roll.
@@ -73,21 +76,17 @@ inline std::optional<uint32_t> mgsHudPage(const replay::DrawArea &area,
 }
 
 inline bool isMgsHudCandidate(const replay::DrawPacket &packet) {
-  return !packet.originalMesh &&
+  return !packet.originalMesh && packet.surfaceEffect.kind != replay::MgsSurfaceKind::Panorama &&
          (packet.route == replay::PacketRoute::Screen2D || packet.validMask == 0);
 }
 
-// MGS's background DRAWENV clears can arrive as TILE/POLY_F4 DrawPackets,
-// not just FillRect operations. A flat opaque rectangle covering the complete
-// draw page supplies the native scene background, not a floating HUD plate.
-// Keep textured panels, radar subrects and semi-transparent fades intact.
-inline bool isMgsHudBackground(const replay::DrawPacket &packet,
+// Native coordinates already contain drawOffset. Require the actual uniform
+// rectangle and full draw page, not a bounding box around a partial/diagonal quad.
+inline bool mgsFullPageRectangle(const replay::DrawPacket &packet,
                                 uint32_t pageX, uint32_t width, uint32_t height) {
-  if (!isMgsHudCandidate(packet) || (packet.opcode != 0x60 && packet.opcode != 0x28) ||
-      packet.vertexCount != 4 || packet.textured || packet.gouraud ||
-      packet.state.blend.enabled || packet.state.mask.forceMaskBit || packet.state.mask.checkMaskBit ||
-      packet.screenEffect.kind != replay::MgsScreenEffectKind::None ||
-      packet.surfaceEffect.kind != replay::MgsSurfaceKind::None || width == 0 || height == 0)
+  if (!isMgsHudCandidate(packet) || packet.vertexCount != 4 || packet.textured ||
+      packet.gouraud || packet.state.mask.forceMaskBit || packet.state.mask.checkMaskBit ||
+      packet.surfaceEffect.kind != replay::MgsSurfaceKind::None || !width || !height)
     return false;
   const auto &a = packet.state.drawArea;
   if (a.left != int32_t(pageX) || a.top != 0 ||
@@ -96,12 +95,44 @@ inline bool isMgsHudBackground(const replay::DrawPacket &packet,
   const auto &v = packet.vertices;
   for (unsigned i = 1; i < 4; ++i)
     if (v[i].color != v[0].color) return false;
-  // Native coordinates already contain drawOffset. Test the actual rectangle,
-  // not a bounding box that could also describe a diagonal or partial quad.
   return v[0].nativeX == v[2].nativeX && v[1].nativeX == v[3].nativeX &&
          v[0].nativeY == v[1].nativeY && v[2].nativeY == v[3].nativeY &&
          v[0].nativeX <= int32_t(pageX) && v[1].nativeX >= int32_t(pageX + width) &&
          v[0].nativeY <= 0 && v[2].nativeY >= int32_t(height);
+}
+
+// DRAWENV clears supply the native scene background, not a floating HUD plate.
+inline bool isMgsHudBackground(const replay::DrawPacket &packet,
+                                uint32_t pageX, uint32_t width, uint32_t height) {
+  return (packet.opcode == 0x60 || packet.opcode == 0x28) &&
+         !packet.state.blend.enabled && packet.screenEffect.kind == replay::MgsScreenEffectKind::None &&
+         mgsFullPageRectangle(packet, pageX, width, height);
+}
+
+// Full-page untextured blends affect the entire eye. Small radar/menu panels
+// retain their HUD placement and existing textured/STP rendering path.
+inline bool isMgsEyeOverlay(const replay::DrawPacket &packet,
+                            uint32_t pageX, uint32_t width, uint32_t height) {
+  return (packet.opcode == 0x62 || packet.opcode == 0x2a) && packet.state.blend.enabled &&
+         mgsFullPageRectangle(packet, pageX, width, height);
+}
+inline Vec3 mgsEyeOverlayPosition(double x, double y, uint32_t pageX,
+                                  uint32_t width, uint32_t height) {
+  // Positive Vulkan viewport height: clip Y=-1 is the top of the eye.
+  return {float(2 * (x - pageX) / width - 1), float(2 * y / height - 1), 0};
+}
+struct MgsEyeOverlayBlend {
+  float foreground, background;
+  bool subtract;
+};
+inline MgsEyeOverlayBlend mgsEyeOverlayBlend(replay::BlendMode mode) {
+  switch (mode) {
+    case replay::BlendMode::HalfBackgroundPlusHalfForeground: return {0.5f, 0.5f, false};
+    case replay::BlendMode::BackgroundPlusForeground: return {1, 1, false};
+    case replay::BlendMode::BackgroundMinusForeground: return {1, 1, true};
+    case replay::BlendMode::BackgroundPlusQuarterForeground: return {0.25f, 1, false};
+  }
+  return {1, 1, false};
 }
 
 // Invert the retained channel transform, including its Q12 rounding. The
@@ -117,6 +148,63 @@ inline std::optional<Vec3> worldFromView(const Matrix &m, Vec3 p) {
   const float det = dot(a,bc);
   if (!std::isfinite(det) || std::abs(det) < 1e-6f) return {};
   return Vec3{dot(p,bc)/det, dot(p,cross(c,a))/det, dot(p,cross(a,b))/det};
+}
+
+// The renderer and diagnostics share this original-corner transform path.
+inline bool sourceMeshPosition(std::span<const uint8_t> bytes,
+                  const replay::OriginalMeshGeometry &mesh,
+                  unsigned lane, Vec3 &out, bool widescreen,
+                  const std::map<uint32_t, Matrix> *changes = nullptr) {
+  Vec3 eye{};
+  for (unsigned corner = 0; corner < 4; ++corner) {
+    const float weight = mesh.weights[lane][corner];
+    if (weight == 0) continue;
+    const uint32_t reference = mesh.pointBytes[corner];
+    const bool packed = reference >> 31;
+    const size_t offset = reference & 0x7fffffffu;
+    if (offset > bytes.size() || bytes.size() - offset < (packed ? 6u : 12u))
+      return false;
+    Vec3 point{};
+    for (unsigned axis = 0; axis < 3; ++axis) {
+      if (packed) {
+        int16_t value;
+        std::memcpy(&value, bytes.data() + offset + axis * 2, 2);
+        point[axis] = value;
+      } else {
+        std::memcpy(&point[axis], bytes.data() + offset + axis * 4, 4);
+      }
+    }
+    Vec3 captured{};
+    for (unsigned row = 0; row < 3; ++row) {
+      const auto &r = mesh.viewRows[corner * 3 + row];
+      captured[row] = (point[0]*r[0]+point[1]*r[1]+point[2]*r[2]) + r[3];
+    }
+    if (changes) {
+      const auto change = changes->find(mesh.vrPoseOwners[corner]);
+      if (change != changes->end()) {
+        captured[0] /= widescreen ? 0.75f : 1.0f;
+        captured[1] /= 58.0f / 64.0f;
+        const auto native = worldFromView(mesh.temporalCamera, captured);
+        if (!native) return false;
+        const auto transform = [](const Matrix &m, Vec3 p) {
+          Vec3 result{};
+          for (unsigned r = 0; r < 3; ++r)
+            result[r] = m[12+r]+m[r]*p[0]+m[4+r]*p[1]+m[8+r]*p[2];
+          return result;
+        };
+        captured = transform(mesh.temporalCamera, transform(change->second, *native));
+        captured[0] *= widescreen ? 0.75f : 1.0f;
+        captured[1] *= 58.0f / 64.0f;
+      }
+    }
+    for (unsigned row = 0; row < 3; ++row) eye[row] += weight * captured[row];
+  }
+  eye[0] /= widescreen ? 0.75f : 1.0f;
+  eye[1] /= 58.0f / 64.0f;
+  const auto world = worldFromView(mesh.temporalCamera, eye);
+  if (!world) return false;
+  out = *world;
+  return std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); });
 }
 
 struct Toybox {
