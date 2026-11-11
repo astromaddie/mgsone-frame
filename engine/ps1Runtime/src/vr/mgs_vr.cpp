@@ -243,11 +243,13 @@ struct FramePad {
   std::array<XrAction, std::size(padBindings)> buttons{};
   XrAction stick = XR_NULL_HANDLE;
   XrAction turnStick = XR_NULL_HANDLE, aim = XR_NULL_HANDLE;
+  XrAction weaponMenu = XR_NULL_HANDLE;
   XrSpace aimSpace = XR_NULL_HANDLE;
   XrVector2f move{};
   float turn = 0;
+  float grip = 0;
   XrPosef aimPose{};
-  bool aimValid = false, sticksReady = false;
+  bool aimValid = false, sticksReady = false, gripReady = false;
   uint16_t heldThroughFocus = 0xffff;
   bool attached = false;
 
@@ -279,7 +281,7 @@ struct FramePad {
       xrCheck(xrCreateAction(set, &info, &value), "Create MGS pad action");
       return value;
     };
-    std::array<XrActionSuggestedBinding, std::size(padBindings) + 3> bindings{};
+    std::array<XrActionSuggestedBinding, std::size(padBindings) + 4> bindings{};
     for (size_t i = 0; i < buttons.size(); ++i) {
       const auto &item = padBindings[i];
       buttons[i] = action(XR_ACTION_TYPE_BOOLEAN_INPUT, item.name, item.label);
@@ -288,9 +290,11 @@ struct FramePad {
     stick = action(XR_ACTION_TYPE_VECTOR2F_INPUT, "move", "Move");
     turnStick = action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn");
     aim = action(XR_ACTION_TYPE_POSE_INPUT, "aim", "Aim");
+    weaponMenu = action(XR_ACTION_TYPE_FLOAT_INPUT, "weapon_menu", "Weapon Menu");
     bindings[buttons.size()] = {stick, path("/user/hand/left/input/thumbstick")};
     bindings[buttons.size() + 1] = {turnStick, path("/user/hand/right/input/thumbstick")};
     bindings[buttons.size() + 2] = {aim, path("/user/hand/right/input/aim/pose")};
+    bindings[buttons.size() + 3] = {weaponMenu, path("/user/hand/right/input/squeeze/value")};
     XrInteractionProfileSuggestedBinding suggestion{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     suggestion.interactionProfile = path("/interaction_profiles/valve/frame_controller_valve");
     suggestion.countSuggestedBindings = bindings.size();
@@ -310,10 +314,12 @@ struct FramePad {
   uint16_t sample(const FrameRuntime &xr, bool focused) {
     move = {};
     turn = 0;
+    grip = 0;
     aimValid = false;
     if (!attached || !focused) {
       heldThroughFocus = 0xffff;
       sticksReady = false;
+      gripReady = false;
       return 0;
     }
     const XrActiveActionSet active{set, XR_NULL_PATH};
@@ -322,6 +328,7 @@ struct FramePad {
     xrCheck(result, "Sync MGS controller actions");
     if (result == XR_SESSION_NOT_FOCUSED) {
       heldThroughFocus = 0xffff;
+      sticksReady = gripReady = false;
       return 0;
     }
     uint16_t pressed = 0;
@@ -337,6 +344,12 @@ struct FramePad {
     const XrActionStateGetInfo turnQuery{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, turnStick, XR_NULL_PATH};
     XrActionStateVector2f turnState{XR_TYPE_ACTION_STATE_VECTOR2F};
     xrCheck(xrGetActionStateVector2f(xr.session, &turnQuery, &turnState), "Read MGS turning stick");
+    const XrActionStateGetInfo gripQuery{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, weaponMenu, XR_NULL_PATH};
+    XrActionStateFloat gripState{XR_TYPE_ACTION_STATE_FLOAT};
+    xrCheck(xrGetActionStateFloat(xr.session, &gripQuery, &gripState), "Read MGS weapon menu grip");
+    if (gripState.isActive) grip = gripState.currentState;
+    if (grip < 0.25f) gripReady = true;
+    if (!gripReady) grip = 0;
     if (std::hypot(state.currentState.x, state.currentState.y) < 0.25f &&
         std::abs(turnState.currentState.x) < 0.25f)
       sticksReady = true;
@@ -403,7 +416,7 @@ struct Renderer::Impl {
   bool canDraw = false, captured = false, cacheBound = false;
   bool firstPerson = false, switchHeld = false;
   uint64_t playerEpoch = 0, playerLifetime = 0;
-  float baseHeading = 0, stickTurn = 0;
+  float baseHeading = 0, stickTurn = 0, headTurn = 0;
 
   bool offscreen() const { return !directory.empty(); }
   VkDevice device() const { return xr.device; }
@@ -729,7 +742,7 @@ struct Renderer::Impl {
   }
 
   bool addPacket(const replay::DrawPacket &packet, const DisplayAperture &aperture, bool world) {
-    if (materials.size() >= maxFaces || packet.vertexCount > 4 ||
+    if (materials.size() >= maxFaces - 2 || packet.vertexCount > 4 ||
         packet.indexCount == 0 || packet.indexCount > 6)
       return false;
     const uint32_t material = materials.size();
@@ -827,6 +840,7 @@ struct Renderer::Impl {
           playerLifetime = player->bodyLifetime;
           baseHeading = player->yaw * (2 * std::numbers::pi_v<float> / 4096);
           stickTurn = 0;
+          headTurn = 0;
         }
         playerCamera.emplace(*player, baseHeading);
       }
@@ -870,6 +884,41 @@ struct Renderer::Impl {
   }
 
   void drawEyes(const std::array<EyeView, 2> &views) {
+    const bool showAim = playerCamera && pad.aimValid;
+    std::array<Vertex, 12> reticle{};
+    if (showAim) {
+      const auto &q = pad.aimPose.orientation;
+      const auto &p = pad.aimPose.position;
+      const Vec3 origin{p.x, p.y, p.z};
+      const auto direction = rotate({q.x, q.y, q.z, q.w}, {0, 0, -1});
+      Vec3 target{};
+      for (unsigned axis = 0; axis < 3; ++axis)
+        target[axis] = origin[axis] + direction[axis] * 3.5f;
+      const auto right = rotate(views[0].orientation, {1, 0, 0});
+      const auto up = rotate(views[0].orientation, {0, 1, 0});
+      constexpr uint32_t material = maxFaces - 1;
+      Material marker;
+      marker.native[3] = 255;
+      static_cast<Material *>(materialBuffer.mapped)[material] = marker;
+      const auto point = [&](float x, float y) {
+        Vec3 position = target;
+        for (unsigned axis = 0; axis < 3; ++axis)
+          position[axis] += right[axis] * x + up[axis] * y;
+        return Vertex{position, {}, {0.55f, 1, 0.65f}, material};
+      };
+      const auto bar = [&](unsigned first, float x, float y) {
+        reticle[first] = point(-x, -y);
+        reticle[first + 1] = point(x, -y);
+        reticle[first + 2] = point(-x, y);
+        reticle[first + 3] = point(x, -y);
+        reticle[first + 4] = point(x, y);
+        reticle[first + 5] = point(-x, y);
+      };
+      bar(0, 0.018f, 0.006f);
+      bar(6, 0.006f, 0.018f);
+      std::memcpy(static_cast<Vertex *>(vertexBuffer.mapped) + vertices.size(),
+                  reticle.data(), sizeof(reticle));
+    }
     std::array<uint32_t, 2> image{};
     if (!offscreen()) for (size_t i = 0; i < image.size(); ++i) image[i] = xr.acquire(i);
     vkCheck(vkResetCommandBuffer(xr.commands, 0), "Reset VR command buffer");
@@ -909,6 +958,12 @@ struct Renderer::Impl {
       draw(worldPipeline, 0, solidVertices);
       draw(translucentPipeline, solidVertices, worldVertices);
       draw(panelPipeline, worldVertices, vertices.size());
+      if (showAim) {
+        const auto pointerMatrix = eyeMatrix(Anchor{}, views[i]);
+        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(pointerMatrix), pointerMatrix.data());
+        draw(panelPipeline, vertices.size(), vertices.size() + reticle.size());
+      }
       vkCmdEndRenderPass(xr.commands);
       if (offscreen()) {
         VkBufferImageCopy copy{};
@@ -976,7 +1031,24 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
       }
       if (const char *heading = std::getenv("PS1_VR_HEADLESS_AIM_YAW")) {
         const float angle = std::strtof(heading, nullptr);
-        games::mgs::setVrShotDirection({std::sin(angle), 0, std::cos(angle)});
+        const char *pitchValue = std::getenv("PS1_VR_HEADLESS_AIM_PITCH");
+        const float pitch = pitchValue ? std::strtof(pitchValue, nullptr) : 0;
+        const float horizontal = std::cos(pitch);
+        games::mgs::setVrShotDirection({std::sin(angle) * horizontal, std::sin(pitch),
+                                      std::cos(angle) * horizontal});
+        const float halfYaw = (angle - state.baseHeading) * 0.5f;
+        const float halfPitch = pitch * 0.5f;
+        const Quaternion q{std::cos(halfYaw) * std::sin(halfPitch),
+                           std::sin(halfYaw) * std::cos(halfPitch),
+                           -std::sin(halfYaw) * std::sin(halfPitch),
+                           std::cos(halfYaw) * std::cos(halfPitch)};
+        state.pad.aimPose = {{q[0], q[1], q[2], q[3]}, {0.18f, -0.16f, -0.3f}};
+        state.pad.aimValid = true;
+        // The diagnostic fire input still goes through the original pad.
+        sample.facing = uint16_t(int32_t(std::lround(angle *
+            (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
+        sample.aimPitch = int16_t(std::lround(-pitch *
+            (4096 / (2 * std::numbers::pi_v<float>))));
       }
     }
     return true;
@@ -992,7 +1064,14 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
   }
   state.switchHeld = switchPressed;
   sample.buttons &= ~input::BTN_R3;
-  games::mgs::setVrShotDirection({});
+  if (state.firstPerson && state.playerCamera) {
+    const bool trigger = sample.buttons & input::BTN_R2;
+    sample.buttons &= ~input::BTN_R2;
+    if (trigger) sample.buttons |= input::BTN_SQUARE;
+    if (state.pad.grip > 0.65f) sample.buttons |= input::BTN_R2;
+  }
+  if (!focused || !state.playerCamera || !state.pad.aimValid)
+    games::mgs::setVrShotDirection({});
   if (!state.canDraw) {
     state.xr.end(false);
     return false;
@@ -1011,8 +1090,9 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
     state.stickTurn = std::remainder(state.stickTurn, 2 * std::numbers::pi_v<float>);
     const auto head = rotate(inverse(state.anchor.heading),
         rotate(state.eyes[0].orientation, {0, 0, -1}));
-    const float headTurn = std::atan2(head[0], -head[2]);
-    const float heading = state.baseHeading - state.stickTurn - headTurn;
+    if (std::hypot(head[0], head[2]) > 0.1f)
+      state.headTurn = std::atan2(head[0], -head[2]);
+    const float heading = state.baseHeading - state.stickTurn - state.headTurn;
     float right = state.pad.move.x, forward = state.pad.move.y;
     if (std::hypot(right, forward) < 0.25f) {
       right = float((sample.buttons & input::BTN_RIGHT) != 0) -
@@ -1034,6 +1114,12 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
       const float horizontal = std::hypot(aim[0], aim[2]);
       games::mgs::setVrShotDirection({std::sin(aimHeading) * horizontal, aim[1],
                                     std::cos(aimHeading) * horizontal});
+      if (sample.buttons & input::BTN_SQUARE) {
+        sample.facing = uint16_t(int32_t(std::lround(aimHeading *
+            (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
+        sample.aimPitch = int16_t(std::lround(-std::atan2(aim[1], horizontal) *
+            (4096 / (2 * std::numbers::pi_v<float>))));
+      }
     }
   }
   return focused;

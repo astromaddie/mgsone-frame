@@ -67,10 +67,13 @@ analog sample, with its own pad origin preserved. Scripted views, the original l
 and vents keep their authored cameras. The head-height calculation follows
 the original Snake actor's joint selection. [Snake actor reference](https://github.com/FoxdieTeam/mgs_reversing/blob/1b25ad9babdbefa2a519d20d0f9c3027e19ae517/source/chara/snake/sna_init.c#L8129-L8157)
 
-The right controller's OpenXR aim pose supplies the SOCOM and FAMAS shot
-direction. A fingerprinted entry hook adjusts the local matrix passed by
+The right controller's OpenXR aim pose supplies weapon facing and pitch
+during a shot. A fingerprinted entry hook also adjusts the local matrix passed by
 the player weapon actors to the original NewBullet constructor. It preserves
 the muzzle position and the original firing, ammunition and collision code.
+The three resident player call sites cover SOCOM, FAMAS and rifle bullets.
+The right trigger uses the game's Square action, and the right grip uses
+R2 for the weapon menu. A small projected marker shows the controller's aim.
 
 The native scanout supplies a fixed cinema panel for the title screen,
 video and Codec. In the world, legacy 2D packets supply the initial HUD.
@@ -121,3 +124,41 @@ eyes matched byte for byte, with 48.61% stereo pixel difference at a
 At startup, the guest waits for focus before dispatching game code. The
 standby check submitted the initial projection and completed without CD
 timeouts.
+
+The runtime suite passed 1,365 tests with 32 optional skips. The bridge
+installer's identity and idempotence checks also passed against the imported
+USA executable. A second SOCOM check added 0.25 radians of upward controller
+aim. The retail shot's Q12 direction was (3969, 1013, 0). The aim marker
+covered 13 pixels in each 768×768 eye, increased from a four-pixel thin
+marker that lost its horizontal bar at that size.
+
+To repeat the first-person check, restore the VBlank 16001 dock state in an
+isolated profile. That checkpoint has the original pause flag set. Use this
+input file to resume before measuring movement:
+
+```sh
+printf '16005 16010 start\n' > "$capture/unpause.input"
+SDL_AUDIODRIVER=dummy PS1_MGS_ASSET_CACHE="$media/assets.mgsc" \
+PS1_AUTOLOAD_VBLANK=1 PS1_EXIT_AFTER_LOAD_VBLANKS=180 \
+PS1_INPUT_SCRIPT="$capture/unpause.input" PS1_VR_FIRST_PERSON=1 \
+PS1_VR_CAPTURE_VBLANK=16060 \
+build/ps1Runtime/ps1Runtime --config "$profile/runtime.toml" --vr-headless "$capture/stationary"
+```
+
+Repeat at VBlank 16115 with `PS1_VR_HEADLESS_MOVE_YAW=0`, then
+`PS1_VR_HEADLESS_MOVE_YAW=1.57079632679`. The diagnostic supplies forward
+input through the production head-relative analog mapping after VBlank
+16028. Set `PS1_RAM_DUMP_PATH` to a separate file for each run and decode it
+with `mgs_tas.game_state`. A pass has pause level zero and displacement
+along the requested +Z and +X directions.
+
+For the SOCOM check, use an isolated NSV12 copy with `mgs_fixture.patch_ram`
+and `checkpoint_bytes`. Set the signed 16-bit linked weapon field at
+`0x800B752C` to 0 and the SOCOM inventory field at `0x800B7532` to 12.
+Check their original values before applying the fixture. Add
+`16055 16080 square` to the input file and capture at VBlank 16130.
+Use `PS1_VR_HEADLESS_AIM_YAW=1.57079632679`,
+`PS1_VR_HEADLESS_AIM_PITCH=0.25`, `PS1_TRACE_EVENTS=mgs.vr.aimed_shot`
+and a fresh `PS1_TRACE_JSONL` path. A pass contains a retail shot event with
+positive X and Y direction, near-zero Z, plus a visible marker in both eyes.
+These diagnostic pose inputs are read only by `--vr-headless`.

@@ -64,7 +64,8 @@ The face buttons, triggers, bumpers, Menu and View map to the original
 controller using the flat build's gamepad layout. Click the right stick to
 switch between first and third person during play.
 In first person, movement follows the headset and the right stick turns the
-view. Point the right controller to aim the SOCOM and FAMAS.
+view. Point the right controller to aim. The right trigger fires, and the
+right grip opens the weapon menu. The aim marker follows the controller.
 
 ## Evidence
 

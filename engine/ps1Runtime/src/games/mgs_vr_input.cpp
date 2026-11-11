@@ -21,10 +21,10 @@ ShotVector shotCross(const ShotVector &a, const ShotVector &b) {
 }
 
 namespace ps1::games::mgs {
-void applyVrFacing(Memory &memory, uint16_t heading) {
+void applyVrFacing(Memory &memory, uint16_t heading, const int16_t *aimPitch) {
   if (memory.read32(0x800AE0A0u) != 0 ||
       (memory.read32(0x800ADB3Cu) & 0xdc080050u) ||
-      (memory.read32(0x800AE1C8u) & 0x20007283u))
+      (memory.read32(0x800AE1C8u) & (aimPitch ? 0x20007282u : 0x20007283u)))
     return;
   const uint32_t control = memory.read32(0x800AE16Cu);
   if (control < 0x80010020u || control > 0x801FFF80u)
@@ -34,6 +34,11 @@ void applyVrFacing(Memory &memory, uint16_t heading) {
       std::memcmp(memory.ramPtr() + (name & 0x1fffffffu), "snake.c", sizeof("snake.c")) != 0)
     return;
   memory.write16(control + 0x4e, heading & 4095u);
+  if (aimPitch) {
+    memory.write16(control + 8, uint16_t(*aimPitch));
+    memory.write16(control + 10, heading & 4095u);
+    memory.write16(control + 0x4c, uint16_t(*aimPitch));
+  }
 }
 
 void setVrShotDirection(const std::array<float, 3> &direction) noexcept {
@@ -53,7 +58,7 @@ void mgsApplyVrBulletAim(recomp_context *ctx) {
   // These USA call sites pass a 32-byte shot matrix at caller sp + 0x10.
   // Retain every ammo, trigger, actor and collision rule in NewBullet.
   if (!ctx || !ctx->mem || ctx->r5 != 1 ||
-      (ctx->r31 != 0x80067B7Cu && ctx->r31 != 0x800682D8u))
+      (ctx->r31 != 0x80067B7Cu && ctx->r31 != 0x800682D8u && ctx->r31 != 0x8006A2D4u))
     return;
   const uint64_t packed = vrShotDirection.load(std::memory_order_relaxed);
   const uint32_t matrix = ctx->r4;

@@ -12,6 +12,7 @@ struct VrInputSample {
   bool analogMovement = false;
   uint8_t x = 128, y = 128;
   std::optional<uint16_t> facing;
+  std::optional<int16_t> aimPitch;
 };
 
 inline std::array<uint8_t, 2> headRelativeStick(float right, float forward,

@@ -244,7 +244,9 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   // disguises and incapacitation.
   constexpr uint32_t authoredPlayerView = 0x20007283;
   constexpr uint32_t authoredGameView = 0xdc080050;
-  if ((status & authoredPlayerView) || (memory.read32(gameStatus) & authoredGameView) ||
+  const bool weaponView = (status & 1u) && int16_t(memory.read16(0x800B752Cu)) >= 0;
+  const uint32_t playerViewMask = weaponView ? authoredPlayerView & ~1u : authoredPlayerView;
+  if ((status & playerViewMask) || (memory.read32(gameStatus) & authoredGameView) ||
       memory.read32(0x800AE0A0u) != 0)
     return {};
   const uint32_t control = memory.read32(playerControl);

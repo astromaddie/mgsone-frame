@@ -75,7 +75,7 @@ def install(directory, executable, change_overlay=None, overlay_directory=None):
     # shot matrix. Keep the complete retail body and patch only that matrix
     # when the VR host has a tracked aim sample.
     for pc, expected in ((0x80078DC8, 0x27bdffc8), (0x80067B74, 0x0c01e372),
-                         (0x800682D0, 0x0c01e372)):
+                         (0x800682D0, 0x0c01e372), (0x8006A2CC, 0x0c01e372)):
         word, = struct.unpack_from('<I', data, pc - 0x80010000 + 2048)
         if word != expected:
             raise ValueError('USA player projectile call identity mismatch')
