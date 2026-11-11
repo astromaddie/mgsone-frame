@@ -26,9 +26,10 @@ sudo apt-get install git cmake ninja-build clang g++ libsdl2-dev libvulkan-dev g
 ```
 
 On Apple Silicon, use an ARM64 Ubuntu VM (or an ARM64 Linux host over SSH).
-On ARM64 Windows, use ARM64 Ubuntu in WSL2. An x86-64 Linux or Windows host
-needs an ARM64 VM or remote ARM64 Linux host for this recipe; the analyzer and
-recompiler run during the build.
+On ARM64 Windows, use ARM64 Ubuntu in WSL2. For an x86-64 Windows PC, see
+[Windows WSL Development](MGS_WINDOWS_FRAME_DEV.md) for native host tools and
+an ARM64 cross-compiler. The ARM64 recipe here runs the analyzer and recompiler
+during the build, so it needs an ARM64 Linux environment.
 
 ```sh
 bash scripts/build_alpha.sh --steam-frame '/path/to/disc1.cue' '/path/to/disc2.cue'

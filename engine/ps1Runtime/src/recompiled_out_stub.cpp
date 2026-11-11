@@ -17,3 +17,7 @@ void recomp_init_dispatch_table() {
 void recomp_dispatch(uint8_t* /*rdram*/, recomp_context* /*ctx*/, uint32_t /*addr*/) {
     // no-op: no game loaded
 }
+
+void recomp_resume_dispatch(uint8_t* rdram, recomp_context* ctx, uint32_t addr) {
+    recomp_dispatch(rdram, ctx, addr);
+}
