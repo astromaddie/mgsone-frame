@@ -175,7 +175,13 @@ TEST_P(CommonControllerMappingTest, RealDatabaseMappingFeedsOriginalPS1ButtonsAn
   auto *j=attach(c.vendor,c.product,c.name);ASSERT_NE(j,nullptr);
   // Transport/firmware hardware is not emulated: use the real DB mapping with
   // only its GUID replaced by this SDL virtual device's runtime GUID.
-  std::ifstream db(MGS_CONTROLLER_DB);std::string line,record;
+  fs::path database=MGS_CONTROLLER_DB;
+  if(char *base=SDL_GetBasePath()) {
+    database=fs::path(base)/"gamecontrollerdb.txt";
+    SDL_free(base);
+  }
+  std::ifstream db(database);std::string line,record;
+  ASSERT_TRUE(db.is_open())<<database;
   while(std::getline(db,line)) if(line.starts_with(c.guid)){record=line;break;}
   ASSERT_FALSE(record.empty());
   char guid[33];SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(j),guid,sizeof(guid));
