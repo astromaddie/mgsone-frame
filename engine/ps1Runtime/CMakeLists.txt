@@ -456,10 +456,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(${RECOMP_SRC} PROPERTIES
         COMPILE_OPTIONS "${RECOMP_COMPILE_OPTIONS}")
     if((WIN32 OR MGS_STEAM_FRAME) AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND RECOMP_SHARD_SRC)
-        # The support TU contains >19,000 unordered_map registrations in a
-        # single initializer. Inlining the standard library into it makes LLVM optimization
-        # take many minutes. Keep its calls out of line; the actual game shards
-        # and all handwritten runtime/renderer code retain normal optimization.
+        # Shared dispatch helpers stay out of line in the support TU. Startup
+        # registrations are data arrays and short loops; the game shards and
+        # handwritten runtime/renderer retain their normal optimization.
         set_source_files_properties(src/recompiled_out.cpp PROPERTIES
             COMPILE_OPTIONS "${RECOMP_COMPILE_OPTIONS};-fno-inline-functions")
     endif()

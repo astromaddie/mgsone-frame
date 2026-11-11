@@ -124,6 +124,26 @@ runtime and verifies its ELF architecture, direct dependencies and GLIBC,
 GLIBCXX, CXXABI and GCC symbol-version requirements against the Frame sysroot.
 Generated translations and game data stay outside Git.
 
+The generator keeps each overlay's normal and resume lookup in a separate
+function. Startup registrations use data arrays and short insertion loops.
+This keeps the shared support file out of one large optimizer graph without
+changing the guest translation shards or the first matching overlay identity.
+The synthetic regression exercises lookup aliases, resume entries, identity
+precedence and registration through the generated C++:
+
+```sh
+python3 -m unittest scripts.tests.test_native_codegen -v
+```
+
+The test expects `build/ps1Recomp/ps1Recomp`; link that path to the native host
+generator when using the external WSL build folder. For the USA campaign I
+compared every generated registration and overlay condition before and after
+the split: 2,257 entry points, 19,140 resume entries, 31 aliases and 258,208
+overlay cases matched in order. All 160 guest shards were byte identical.
+Clang 18 finished the replacement support file and link in 9 minutes; the
+earlier support compile was still running when I stopped it after 43 minutes.
+The shared PC load differed, so those times aren't a controlled speed comparison.
+
 The project build is a smoke check only. Launch, controller input, Vulkan and
 performance still need their own Frame runs.
 

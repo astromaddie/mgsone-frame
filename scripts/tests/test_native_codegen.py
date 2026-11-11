@@ -1,5 +1,6 @@
 """Synthetic code/data fixtures: no retail assets are required."""
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -11,6 +12,89 @@ RECOMP = ROOT / 'build/ps1Recomp/ps1Recomp'
 
 @unittest.skipUnless(RECOMP.exists(), 'Build ps1Recomp first')
 class NativeCodegenTests(unittest.TestCase):
+    def test_split_overlay_dispatch_preserves_identity_precedence_and_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            exe = bytearray(4096)
+            exe[:8] = b'PS-X EXE'
+            struct.pack_into('<I', exe, 0x10, 0x80010000)
+            struct.pack_into('<II', exe, 0x18, 0x80010000, 2048)
+            struct.pack_into('<II', exe, 2048, 0x03e00008, 0)
+            (path / 'main.exe').write_bytes(exe)
+            config = '''[binary]
+path = "main.exe"
+entry_point = "0x80010000"
+[[functions]]
+name = "boot"
+address = "0x80010000"
+size = 8
+'''
+            # Both overlays deliberately have the same identity prefix. The
+            # first matching identity owns the whole range, including holes.
+            for name, offset in (('first', 8), ('second', 16)):
+                overlay = bytearray(32)
+                struct.pack_into('<II', overlay, offset, 0x03e00008, 0)
+                (path / f'{name}.bin').write_bytes(overlay)
+                config += f'''[[overlays]]
+name = "{name}"
+ram_base = {0x80100000}
+size = 32
+binary_path = "{name}.bin"
+functions = [{0x80100000 + offset}]
+identity_size = 8
+'''
+            (path / 'test.toml').write_text(config)
+            subprocess.run([str(RECOMP), str(path / 'test.toml'), str(path / 'out.cpp')],
+                           cwd=path, capture_output=True, text=True, check=True)
+            generated = (path / 'out.cpp').read_text()
+            start = generated.index('typedef void (*recomp_func_t)')
+            end_marker = '    recomp_table_ready = true;\n}\n'
+            end = generated.index(end_marker, start) + len(end_marker)
+            dispatch = generated[start:end]
+            names = set(re.findall(r'return (\w+);', dispatch)) - {'nullptr'}
+            registrations = re.findall(r'\{0x[0-9A-F]+u, (\w+)\}', dispatch)
+            names.update(registrations)
+            first = dispatch[dispatch.index('static recomp_func_t recomp_lookup_overlay_first('):]
+            resume = first[:first.index('\n    switch (normalized)')]
+            resume_cases = re.findall(r'case 0x([0-9A-F]+)u: return (\w+);', resume)
+            self.assertTrue(resume_cases)
+            resume_address, resume_name = resume_cases[0]
+            harness = '''#include <cassert>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+struct recomp_context {};
+'''
+            harness += ''.join(f'void {name}(uint8_t*, recomp_context*) {{}}\n'
+                               for name in sorted(names))
+            harness += dispatch
+            harness += f'''
+int main() {{
+    std::vector<uint8_t> ram(2 * 1024 * 1024);
+    assert(recomp_lookup_overlay(ram.data(), 0x80100008u) == overlay_first__80100008);
+    assert(recomp_lookup_overlay(ram.data(), 0x00100008u) == overlay_first__80100008);
+    assert(recomp_lookup_overlay(ram.data(), 0xA0100008u) == overlay_first__80100008);
+    assert(recomp_lookup_overlay(ram.data(), 0x80100010u) == nullptr);
+    assert(recomp_lookup_overlay(ram.data(), 0x{resume_address}u, true) == {resume_name});
+    assert(recomp_lookup_overlay(ram.data(), 0x8010001Fu, true) == nullptr);
+    ram[0x100000] = 1;
+    assert(recomp_lookup_overlay(ram.data(), 0x80100008u) == nullptr);
+    recomp_init_dispatch_table();
+    assert(recomp_table_ready);
+    assert(recomp_func_table.at(0x80010000u) == boot);
+'''
+            # Exercise every emitted registration through the real init loops.
+            for table, entries in re.findall(
+                    r'static const RecompDispatchEntry (\w+)_entries\[\] = \{(.*?)\n    \};',
+                    dispatch, re.S):
+                for address, name in re.findall(r'\{(0x[0-9A-F]+u), (\w+)\}', entries):
+                    harness += f'    assert({table}.at({address}) == {name});\n'
+            harness += '}\n'
+            (path / 'exercise.cpp').write_text(harness)
+            subprocess.run(['c++', '-std=c++17', str(path / 'exercise.cpp'),
+                            '-o', str(path / 'exercise')], capture_output=True, check=True)
+            subprocess.run([str(path / 'exercise')], check=True)
+
     def test_stack_allocation_in_branch_delay_slot_is_not_a_new_function(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -269,7 +353,8 @@ identity_size = 36
             self.assertIn('L_8010002C:', generated)
             self.assertIn('return overlay_one__80100000;', generated)
             self.assertIn('return overlay_two__80100000;', generated)
-            self.assertNotIn('recomp_func_table[0x80100000]', generated)
+            registrations = generated[generated.index('void recomp_init_dispatch_table()'):]
+            self.assertNotIn('{0x80100000u,', registrations)
             self.assertIn('rdram[0x100020] == 11', generated)
             self.assertIn('rdram[0x100020] == 12', generated)
 
@@ -344,4 +429,6 @@ size = 20
             self.assertLess(boundary, code.index('uint32_t _ds_r2'))
             self.assertLess(boundary, code.index('pgxp_addiu(ctx, 2, 2, -1)'))
             self.assertIn('case 0x80010004u: goto L_80010004;', code)
-            self.assertIn('recomp_resume_table[0x80010004]', code)
+            registrations = code[code.index('static const RecompDispatchEntry recomp_resume_table_entries[]'):]
+            registrations = registrations[:registrations.index('\n    };')]
+            self.assertRegex(registrations, r'\{0x80010004u, \w+\}')

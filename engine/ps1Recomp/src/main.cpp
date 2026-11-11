@@ -1633,8 +1633,8 @@ int main(int argc, char *argv[]) {
     // loaded from disc into RAM at a specific address. Functions are prefixed
     // with overlay name to avoid collisions when multiple overlays share RAM.
     OverlayHandler overlayHandler;
-    std::string overlayLookupBody;
-    std::string overlayResumeBody;
+    std::string overlayLookupFunctions;
+    std::string overlayDispatchBody;
     if (config.contains("overlays")) {
       const auto &overlays =
           toml::find<std::vector<toml::value>>(config, "overlays");
@@ -1905,16 +1905,21 @@ int main(int argc, char *argv[]) {
                     ovl_data[ovl_codeOffset + offset + i]);
             }
           }
-          condition += ") {\n        switch (normalized) {\n";
-          overlayLookupBody += condition;
-          for (auto address : ovl_funcs)
-            overlayLookupBody += fmt::format("        case 0x{:08X}u: return {};\n", address, addr_to_name.at(address));
-          overlayLookupBody += "        default: return nullptr;\n        }\n    }\n";
-          overlayResumeBody += condition;
+          // Keep each overlay's switch in its own function. A single switch
+          // forest for the whole campaign creates a huge LLVM optimizer graph.
+          const auto lookupName = fmt::format("recomp_lookup_overlay_{}", ovl_name);
+          condition += fmt::format(") return {}(normalized, resume);\n", lookupName);
+          overlayDispatchBody += condition;
+          overlayLookupFunctions += fmt::format(
+              "static recomp_func_t {}(uint32_t normalized, bool resume) {{\n"
+              "    if (resume) {{\n        switch (normalized) {{\n", lookupName);
           for (const auto &[address, name] : resume_to_name)
             if (name.rfind("overlay_" + ovl_name + "__", 0) == 0)
-              overlayResumeBody += fmt::format("        case 0x{:08X}u: return {};\n", address, name);
-          overlayResumeBody += "        default: return nullptr;\n        }\n    }\n";
+              overlayLookupFunctions += fmt::format("        case 0x{:08X}u: return {};\n", address, name);
+          overlayLookupFunctions += "        default: return nullptr;\n        }\n    }\n    switch (normalized) {\n";
+          for (auto address : ovl_funcs)
+            overlayLookupFunctions += fmt::format("    case 0x{:08X}u: return {};\n", address, addr_to_name.at(address));
+          overlayLookupFunctions += "    default: return nullptr;\n    }\n}\n\n";
           addr_to_name = baseNames;
           resume_to_name = baseResumes;
         }
@@ -2040,9 +2045,10 @@ int main(int argc, char *argv[]) {
     result_cpp +=
         "typedef void (*recomp_func_t)(uint8_t*, recomp_context*);\n\n";
 
-    result_cpp += "static recomp_func_t recomp_lookup_overlay(uint8_t* rdram, uint32_t addr, bool resume = false) {\n    const uint32_t normalized = (addr & 0x1fffffffu) | 0x80000000u;\n    if (resume) {\n";
-    result_cpp += overlayResumeBody;
-    result_cpp += "    } else {\n" + overlayLookupBody + "    }\n    return nullptr;\n}\n\n";
+    result_cpp += overlayLookupFunctions;
+    result_cpp += "static recomp_func_t recomp_lookup_overlay(uint8_t* rdram, uint32_t addr, bool resume = false) {\n    const uint32_t normalized = (addr & 0x1fffffffu) | 0x80000000u;\n";
+    result_cpp += overlayDispatchBody;
+    result_cpp += "    return nullptr;\n}\n\n";
 
     // Global dispatch table (unordered_map)
     result_cpp += "static std::unordered_map<uint32_t, recomp_func_t> recomp_func_table;\n";
@@ -2050,7 +2056,20 @@ int main(int argc, char *argv[]) {
     result_cpp += "static std::unordered_map<uint32_t, recomp_func_t> recomp_entry_alias_table;\n";
     result_cpp += "static bool recomp_table_ready = false;\n\n";
 
-    // Init function: populate the map once
+    // Emit registrations as data. Thousands of unrolled unordered_map writes
+    // turn this cold initializer into an expensive optimizer workload.
+    result_cpp += "struct RecompDispatchEntry { uint32_t address; recomp_func_t function; };\n\n";
+    const auto emitEntries = [&](const char *table, const auto &entries) {
+      if (entries.empty()) return;
+      result_cpp += fmt::format("    static const RecompDispatchEntry {}_entries[] = {{\n", table);
+      for (const auto &[addr, name] : entries)
+        result_cpp += fmt::format("        {{0x{:08X}u, {}}},\n", addr, name);
+      result_cpp += "    };\n";
+      result_cpp += fmt::format(
+          "    for (const auto &entry : {}_entries)\n"
+          "        {}[entry.address] = entry.function;\n", table, table);
+    };
+    // Init function: populate the maps once, in the original insertion order.
     result_cpp += "void recomp_init_dispatch_table() {\n";
     result_cpp += fmt::format("    recomp_func_table.reserve({});\n",
                               addr_to_name.size() + 16);
@@ -2058,17 +2077,9 @@ int main(int argc, char *argv[]) {
                               resume_to_name.size() + 16);
     result_cpp += fmt::format("    recomp_entry_alias_table.reserve({});\n",
                               entry_alias_to_name.size() + 16);
-    for (const auto &[addr, name] : addr_to_name) {
-      result_cpp += fmt::format("    recomp_func_table[0x{:08X}] = {};\n", addr, name);
-    }
-    for (const auto &[addr, name] : resume_to_name) {
-      result_cpp += fmt::format("    recomp_resume_table[0x{:08X}] = {};\n",
-                                addr, name);
-    }
-    for (const auto &[addr, name] : entry_alias_to_name) {
-      result_cpp += fmt::format(
-          "    recomp_entry_alias_table[0x{:08X}] = {};\n", addr, name);
-    }
+    emitEntries("recomp_func_table", addr_to_name);
+    emitEntries("recomp_resume_table", resume_to_name);
+    emitEntries("recomp_entry_alias_table", entry_alias_to_name);
     result_cpp += "    recomp_table_ready = true;\n";
     result_cpp += "}\n\n";
 
