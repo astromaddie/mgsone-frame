@@ -29281,12 +29281,12 @@ void RendererVulkan::setHostController(_SDL_GameController *controller) {
                                 controller ? &controller : nullptr, controller ? 1 : 0);
 }
 
-bool RendererVulkan::beginVrFrame(uint16_t &buttons) {
-  buttons = 0;
+bool RendererVulkan::beginVrFrame(input::VrInputSample &sample) {
+  sample = {};
 #ifdef PS1_MGS_OPENXR
   if (impl_ && impl_->mgsVr && healthy_) {
     try {
-      return impl_->mgsVr->beginFrame(buttons);
+      return impl_->mgsVr->beginFrame(sample);
     } catch (const std::exception &error) {
       fmt::print(stderr, "[MGS VR] frame start failed: {}\n", error.what());
       healthy_ = false;

@@ -61,7 +61,10 @@ For VR, add a separate shortcut to the same script with `--vr` in its launch
 options. It opens the game directly in SteamVR and shares the flat build's
 disc import, settings and saves. The Frame D-pad and left stick move Snake.
 The face buttons, triggers, bumpers, Menu and View map to the original
-controller using the flat build's gamepad layout.
+controller using the flat build's gamepad layout. Click the right stick to
+switch between first and third person during play.
+In first person, movement follows the headset and the right stick turns the
+view. Point the right controller to aim the SOCOM and FAMAS.
 
 ## Evidence
 

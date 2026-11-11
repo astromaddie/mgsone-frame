@@ -45,3 +45,36 @@ TEST(HostInputTest, DisconnectReleasesAxesTriggersAndButtons) {
   host.clear(); host.apply(input);
   EXPECT_EQ(input.buttonState(), 0xffff);
 }
+
+TEST(HostInputTest, VrMovementUsesTheHeadHeadingAndOriginalPadOrigin) {
+  constexpr float quarterTurn = std::numbers::pi_v<float> / 2;
+  EXPECT_EQ(headRelativeStick(0, 1, 0, 0), (std::array<uint8_t, 2>{128, 255}));
+  EXPECT_EQ(headRelativeStick(0, 1, quarterTurn, 0), (std::array<uint8_t, 2>{255, 128}));
+  EXPECT_EQ(headRelativeStick(0, 1, quarterTurn, 1024), (std::array<uint8_t, 2>{128, 255}));
+  EXPECT_EQ(headRelativeStick(1, 0, 0, 0), (std::array<uint8_t, 2>{1, 128}));
+  EXPECT_EQ(headRelativeStick(0, 0, quarterTurn, 0), (std::array<uint8_t, 2>{128, 128}));
+}
+
+TEST(HostInputTest, VrAnalogMovementPreservesTheActionButtonsAndReleasesOnPause) {
+  InputController input;
+  HostInput host;
+  host.gamepad = BTN_UP | BTN_SQUARE;
+  VrInputSample vr;
+  vr.analogMovement = true;
+  vr.x = 255;
+  vr.y = 128;
+  host.apply(input, false, &vr);
+  input.latchVBlank();
+  auto sample = input.latchedSample()[0];
+  EXPECT_EQ(sample.padType, PadType::Analog);
+  EXPECT_EQ(sample.analogLX, 255);
+  EXPECT_EQ(sample.analogLY, 128);
+  EXPECT_NE(sample.buttons & BTN_UP, 0);
+  EXPECT_EQ(sample.buttons & BTN_SQUARE, 0);
+  host.apply(input, true, &vr);
+  input.latchVBlank();
+  sample = input.latchedSample()[0];
+  EXPECT_EQ(sample.analogLX, 128);
+  EXPECT_EQ(sample.analogLY, 128);
+  EXPECT_EQ(sample.buttons, 0xffff);
+}

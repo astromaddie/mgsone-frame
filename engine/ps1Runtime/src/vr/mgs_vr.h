@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include "runtime/input/vr_input.h"
 
 namespace ps1::gpu {
 class GPU;
@@ -11,7 +12,7 @@ class Renderer {
 public:
   Renderer(GPU &gpu, const std::filesystem::path &captureDirectory);
   ~Renderer();
-  bool beginFrame(uint16_t &buttons);  // true when the guest may advance
+  bool beginFrame(input::VrInputSample &sample);  // true when the guest may advance
   void present();
   void rebase();
   bool running() const;

@@ -1,5 +1,6 @@
 #pragma once
 #include "runtime/input/input.h"
+#include "runtime/input/vr_input.h"
 #include <array>
 #include <cstdint>
 
@@ -29,13 +30,17 @@ public:
     if (axes[5] >= 16000) mask |= BTN_R2;
     return mask;
   }
-  void apply(InputController &input, bool suppress = false) const {
+  void apply(InputController &input, bool suppress = false,
+             const VrInputSample *vr = nullptr) const {
+    const bool analog = vr && vr->analogMovement && !suppress;
     for (int p = 0; p < 2; ++p) {
-      const auto type = p == port ? PadType::Digital : PadType::None;
+      const auto type = p == port ? (analog ? PadType::Analog : PadType::Digital) : PadType::None;
       if (input.getPadType(p) != type) input.setPadType(p, type);
       input.release(0xffffu, p);
-      if (p == port && !suppress) input.press(buttons(), p);
-      input.setAnalog(p, 128, 128, 128, 128);
+      if (p == port && !suppress)
+        input.press(analog ? buttons() & ~uint16_t(0xf0) : buttons(), p);
+      input.setAnalog(p, p == port && analog ? vr->x : 128,
+                         p == port && analog ? vr->y : 128, 128, 128);
     }
   }
 };

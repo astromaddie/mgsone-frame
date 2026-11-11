@@ -25,6 +25,7 @@ sourceMeshMaterial(const AssetCache &assets, const Memory &memory,
 struct SceneRecoveryReplay {
   uint64_t capture = 0;
   uint32_t orderingTable = 0;
+  std::optional<gpu::replay::MgsPlayerView> playerView;
   std::array<std::vector<gpu::replay::DrawPacket>, 256> buckets;
   struct Mesh {
     gpu::replay::DrawPacket draw;

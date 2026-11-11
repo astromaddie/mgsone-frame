@@ -16,7 +16,7 @@ class DecompBridgeTests(unittest.TestCase):
             f'void func_{pc:08X}(uint8_t *ram, recomp_context *ctx) {{\n'
             f'    PS1_FUNCTION_TRACE_HOOK(ctx, 0x{pc:08X}u);\n'
             '    const bool restored = ctx->nativeResumePc != 0;\n}\n'
-            for pc in (*bridges.ENTRIES, 0x80024A64)) +
+            for pc in (*bridges.ENTRIES, 0x80024A64, 0x80078DC8)) +
             '\n    PS1_PC_TRACE_HOOK(ctx, 0x800207C0u);\n')
         return path
 
@@ -43,6 +43,7 @@ class DecompBridgeTests(unittest.TestCase):
             self.assertEqual(installed.count('if (mgsTryDecompiled('), 4)
             self.assertEqual(installed.count('if (mgsTryFastStageSync('), 1)
             self.assertEqual(installed.count('mgsReleaseFastPcxScratch(ctx);'), 1)
+            self.assertEqual(installed.count('mgsApplyVrBulletAim(ctx);'), 1)
             self.assertEqual(bridges.install(root, exe), 0)
             self.assertEqual(source.read_text(), installed)
             source.write_text(installed.replace('0x8001E378u);', '0x8001E370u);', 1))

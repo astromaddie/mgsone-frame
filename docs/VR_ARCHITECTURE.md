@@ -54,7 +54,23 @@ to use the original scene snapshots. The renderer expands the original
 geometry once for both eyes and draws it through two depth-tested,
 asymmetric projections. The opening view follows the original third-person
 camera. Tracked position and orientation are relative to the first valid
-head position and heading. The current scale is 1,000 game units per metre.
+head position and heading after SteamVR gives the game focus. The current
+scale is 1,000 game units per metre.
+
+Clicking the right stick switches the gameplay camera. In first person,
+the camera follows Snake's live position, head height and facing. The
+renderer takes that pose from the same snapshot as the geometry and hides
+Snake's body so the camera can see out. Forward input follows the headset's
+horizontal heading. The right stick adds smooth turning at up to 90°/s,
+and head rotation adds to it. The original movement code reads a rotated
+analog sample, with its own pad origin preserved. Scripted views, the original look mode
+and vents keep their authored cameras. The head-height calculation follows
+the original Snake actor's joint selection. [Snake actor reference](https://github.com/FoxdieTeam/mgs_reversing/blob/1b25ad9babdbefa2a519d20d0f9c3027e19ae517/source/chara/snake/sna_init.c#L8129-L8157)
+
+The right controller's OpenXR aim pose supplies the SOCOM and FAMAS shot
+direction. A fingerprinted entry hook adjusts the local matrix passed by
+the player weapon actors to the original NewBullet constructor. It preserves
+the muzzle position and the original firing, ammunition and collision code.
 
 The native scanout supplies a fixed cinema panel for the title screen,
 video and Codec. In the world, legacy 2D packets supply the initial HUD.
@@ -92,3 +108,16 @@ The same build opened two 1728×1728 sRGB swapchains in SteamVR and
 submitted its first projection frame. SteamVR accepted the suggested
 Frame controller bindings. That startup session stayed in
 `XR_SESSION_STATE_SYNCHRONIZED`; the guest clock remained paused.
+
+The first-person control check resumed the dock checkpoint before applying
+input. Two synthetic headset headings moved Snake 3.608 m and 1.554 m in
+the requested directions, with heading agreement of 0.996 and 1.000.
+An isolated copy of the same state equipped the original SOCOM. A normal
+Square press and release produced a retail NewBullet call whose direction
+was +X, matching the supplied tracked aim sample. Coincident first-person
+eyes matched byte for byte, with 48.61% stereo pixel difference at a
+6/255 RGB threshold.
+
+At startup, the guest waits for focus before dispatching game code. The
+standby check submitted the initial projection and completed without CD
+timeouts.

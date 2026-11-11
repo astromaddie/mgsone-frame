@@ -1,5 +1,6 @@
 #include <runtime/games/mgs_profile.h>
 #include "runtime/games/mgs_disc.h"
+#include "runtime/games/mgs_vr_input.h"
 // ps1Runtime -- PS1 Hardware Simulation Runtime
 // Full system integration: CPU, GPU, SPU, CD-ROM, DMA, Input, MDEC, Timers
 // Game code runs in separate thread; main thread handles SDL events + rendering
@@ -1473,8 +1474,7 @@ int main(int argc, char *argv[]) {
     }
   });
 
-  // Launch game thread
-  std::thread gameThread([&]() {
+  const auto runGuest = [&]() {
     // Identify ourselves so Bios::queueCdromEvent can inline-drain when
     // the IRQ callback fires synchronously from MIPS-driven port writes
     // on this thread.
@@ -1511,7 +1511,10 @@ int main(int argc, char *argv[]) {
     }
     gameFinished.store(true, std::memory_order_release);
     gameThreadDone.store(true, std::memory_order_release);
-  });
+  };
+  std::thread gameThread;
+  if (!mgsVr)
+    gameThread = std::thread(runGuest);
 
   const uint32_t guestCyclesPerVblank = CPU_CLOCK / guestRefreshHz;
   const uint32_t baseCyclesPerScanline = guestCyclesPerVblank / guestScanlines;
@@ -1606,6 +1609,7 @@ int main(int argc, char *argv[]) {
   std::optional<std::chrono::steady_clock::time_point> diagnosticLoadEpoch;
   uint64_t diagnosticRestoredVblank = 0u;
   bool running = true;
+  bool vrGuestFocused = false;
   bool tasSaveRequested = false;
   bool tasStopRequested = false;
   bool tasPaused = false;
@@ -2114,14 +2118,20 @@ int main(int argc, char *argv[]) {
       std::this_thread::sleep_for(std::chrono::milliseconds(16));
       continue;
     }
-    uint16_t vrButtons = 0;
-    const bool vrFocused = !mgsVr || renderer.beginVrFrame(vrButtons);
+    ps1::input::VrInputSample vrInput;
+    const bool vrFocused = !mgsVr || renderer.beginVrFrame(vrInput);
     if (mgsVr && managedInput) {
       const auto pad = controllers.gameplay(!vrFocused);
-      hostInput.gamepad = pad.buttons | vrButtons;
+      hostInput.gamepad = pad.buttons | vrInput.buttons;
       hostInput.axes = pad.axes;
       hostInput.deadzone = controllers.deadzone();
-      hostInput.apply(input, !vrFocused);
+      hostInput.apply(input, !vrFocused, &vrInput);
+    }
+    if (mgsVr && vrFocused != vrGuestFocused) {
+      stateCoordinator.setHostPaused(!vrFocused);
+      vrGuestFocused = vrFocused;
+      if (vrFocused && !gameThread.joinable())
+        gameThread = std::thread(runGuest);
     }
     if (!vrFocused) {
       if (!hostAudioPaused && audioDevice > 0) SDL_PauseAudioDevice(audioDevice, 1);
@@ -2387,6 +2397,8 @@ int main(int argc, char *argv[]) {
       if (!tas.active()) {
         if (inputScriptEnabled)
           inputScript.apply(newCount, input);
+        if (mgsVr && vrInput.facing)
+          ps1::games::mgs::applyVrFacing(memory, *vrInput.facing);
         input.latchVBlank();
       }
       if (!mgsProfile) {

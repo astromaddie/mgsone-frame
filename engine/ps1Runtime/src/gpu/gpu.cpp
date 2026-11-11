@@ -288,6 +288,7 @@ void GPU::configureReplay(ReplayConfig config) {
   }
   config.internalScale = std::max(config.internalScale, 1u);
   replayRecorder_.configure(config);
+  replayPlayerView_.reset();
   activeReplayPacketSequence_ = replay::UNASSIGNED_PACKET_SEQUENCE;
   activeReplayPacketUnsupported_ = false;
   replayPaintCaptureActive_ = false;
@@ -314,6 +315,7 @@ void GPU::clearDepthBuffer() {
 void GPU::reset() { resetState(true); }
 
 void GPU::resetState(bool clearVideoMemory) {
+  replayPlayerView_.reset();
   {
     std::lock_guard lock(displayMutex_);photoPresentations_.clear();
   }
@@ -468,6 +470,7 @@ void GPU::resetState(bool clearVideoMemory) {
 void GPU::loadVram(const uint8_t *data) {
   std::lock_guard<std::recursive_mutex> timelineLock(gpuTimelineMutex_);
   ++mutationSerial_;
+  replayPlayerView_.reset();
   // Finish the observable prefix of an interrupted A0 before the save-state
   // establishes a new immutable baseline. The not-yet-received suffix never
   // touched native VRAM and therefore must not appear in the replay stream.
@@ -653,6 +656,8 @@ void GPU::snapshotDisplayBuffer(uint64_t latchFrame) {
     replayLatch.display.interlaced = (gpuStat_ & (1u << 22)) != 0;
     replayLatch.display.oddField = (gpuStat_ & (1u << 31)) != 0;
     replayLatch.mgsPhotoCapture=games::mgs::consumePhotoCaptureEvent();
+    replayLatch.mgsPlayerView = replayPlayerView_;
+    replayPlayerView_.reset();
     displayReplayFrame_ = replayRecorder_.sealAndPublish(replayLatch);
     if(replayLatch.mgsPhotoCapture) {
       if(photoPresentations_.size()==8) {
@@ -1780,6 +1785,7 @@ std::function<void(uint32_t)> GPU::observePresentationList(uint32_t start,
       games::mgs::recoverSceneReplay(start, {ram, ps1::Memory::RAM_SIZE});
   if (!sceneRecovery)
     return {};
+  replayPlayerView_ = sceneRecovery->playerView;
   return
       [this, sceneRecovery = std::move(sceneRecovery)](uint32_t currentAddr) {
         replaySourceMeshCommand_ = UINT32_MAX;

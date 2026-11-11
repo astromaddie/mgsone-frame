@@ -216,6 +216,7 @@ add_library(ps1Runtime_lib STATIC
     src/games/crash3_scenery_construction.cpp
     src/games/crash3_profile.cpp
     src/games/mgs_profile.cpp
+    src/games/mgs_vr_input.cpp
     src/games/mgs_disc.cpp
     src/games/mgs_decomp.cpp
     src/games/mgs_decomp/texture.c

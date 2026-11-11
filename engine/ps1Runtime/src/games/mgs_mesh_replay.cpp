@@ -97,6 +97,7 @@ struct RecoveryFace {
 struct RecoverySource {
   uint64_t capture = 0;
   uint32_t orderingTable = 0;
+  std::optional<gpu::replay::MgsPlayerView> playerView;
   std::vector<RecoveryFace> faces;
 };
 std::array<RecoverySource, 2> recoverySources;
@@ -231,6 +232,43 @@ void applySourceGeometry(gpu::replay::DrawPacket &packet, const Face &face) {
   packet.state.depth.compare = gpu::replay::DepthCompare::Always;
   packet.state.depth.invalidateOnAccepted = packet.state.blend.enabled;
 }
+std::optional<gpu::replay::MgsPlayerView>
+capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
+  // USA v1.0 witnesses from the live player control and the Snake actor.
+  constexpr uint32_t playerControl = 0x800AE16C, playerStatus = 0x800AE1C8;
+  constexpr uint32_t gameStatus = 0x800ADB3C;
+  constexpr uint32_t controlOffset = 0x20, bodyPointerOffset = 0x7c;
+  constexpr uint32_t headModel = 6;
+  const uint32_t status = memory.read32(playerStatus);
+  // Keep the authored views for look mode, vents, cut-ins, scripted scenes,
+  // disguises and incapacitation.
+  constexpr uint32_t authoredPlayerView = 0x20007283;
+  constexpr uint32_t authoredGameView = 0xdc080050;
+  if ((status & authoredPlayerView) || (memory.read32(gameStatus) & authoredGameView) ||
+      memory.read32(0x800AE0A0u) != 0)
+    return {};
+  const uint32_t control = memory.read32(playerControl);
+  if (control < 0x80010000u || !range(control, bodyPointerOffset + 4))
+    return {};
+  const uint32_t actorName = memory.read32(control - controlOffset + 20);
+  if (!range(actorName, sizeof("snake.c")) ||
+      std::memcmp(memory.ramPtr() + (actorName & 0x1fffffffu),
+                  "snake.c", sizeof("snake.c")) != 0)
+    return {};
+  const uint32_t body = memory.read32(control + bodyPointerOffset);
+  const auto instance = std::find_if(scene.instances.begin(), scene.instances.end(),
+      [&](const auto &item) { return item.guestAddress == body; });
+  if (instance == scene.instances.end() || !instance->visible ||
+      instance->models.size() <= headModel)
+    return {};
+  const float y = instance->models[headModel].world[13] + ((status & 0x40u) ? 320.0f : 0.0f);
+  return gpu::replay::MgsPlayerView{
+      scene.epoch, instance->lifetime,
+      {float(int16_t(memory.read16(control))), y, float(int16_t(memory.read16(control + 4)))},
+      scene.view, uint16_t(memory.read16(control + 10) & 4095u),
+      uint16_t(memory.read32(0x800ADAA8u) & 4095u)};
+}
+
 void prepareFullSourceMeshes(const SceneSnapshot &scene, const Memory &memory,
                              RecoverySource &out) {
   if (scene.bufferIndex > 1 || scene.projection <= 0 || scene.clip[2] <= 0 ||
@@ -244,6 +282,8 @@ void prepareFullSourceMeshes(const SceneSnapshot &scene, const Memory &memory,
     return;
   out.capture = scene.sequence;
   out.orderingTable = table & 0x1fffffffu;
+  if (stereoCapture)
+    out.playerView = capturePlayerView(scene, memory);
   uint32_t completeInstances = 0, visibleInstances = 0, visibleFaces = 0;
   for (const auto &instance : scene.instances) {
     if (!instance.visible)
@@ -1297,6 +1337,7 @@ recoverSceneReplay(uint32_t listStart, std::span<const uint8_t> ram) {
   auto result = std::make_unique<SceneRecoveryReplay>();
   result->capture = source.capture;
   result->orderingTable = source.orderingTable;
+  result->playerView = source.playerView;
   uint32_t recovered = 0;
   if (sourceTopologyEnabled) {
     // Paused Codec frames reuse the ordering table after its mesh nodes have

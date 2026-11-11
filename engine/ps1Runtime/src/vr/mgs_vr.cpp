@@ -3,6 +3,7 @@
 #include "xr_vulkan.h"
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_profile.h"
+#include "runtime/games/mgs_vr_input.h"
 #include "runtime/games/mgs_scene.h"
 #include "runtime/gpu/display_geometry.h"
 #include "runtime/gpu/gpu.h"
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <numbers>
 #include <span>
 #include <vector>
 
@@ -67,6 +69,49 @@ struct EyeTarget {
 float dot(const Vec3 &a, const Vec3 &b) {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
+
+Vec3 cross(const Vec3 &a, const Vec3 &b) {
+  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+          a[0] * b[1] - a[1] * b[0]};
+}
+
+Vec3 unit(Vec3 v) {
+  const float length = std::sqrt(dot(v, v));
+  if (length > 1e-8f)
+    for (auto &x : v) x /= length;
+  return v;
+}
+
+Vec3 anchorSpace(const Vec3 &eye) {
+  const float widescreen = games::mgs::widescreen16x9() ? 0.75f : 1;
+  return {eye[0] / (gameUnitsPerMetre * widescreen),
+          -eye[1] / (gameUnitsPerMetre * (58.0f / 64.0f)),
+          -eye[2] / gameUnitsPerMetre};
+}
+
+struct PlayerCamera {
+  Vec3 origin, right, up, forward;
+
+  PlayerCamera(const replay::MgsPlayerView &player, float heading) {
+    const auto &view = player.sourceView;
+    const auto direction = [&](const Vec3 &v) {
+      return Vec3{view[0] * v[0] + view[4] * v[1] + view[8] * v[2],
+                  view[1] * v[0] + view[5] * v[1] + view[9] * v[2],
+                  view[2] * v[0] + view[6] * v[1] + view[10] * v[2]};
+    };
+    Vec3 eye = direction(player.eye);
+    for (unsigned axis = 0; axis < 3; ++axis) eye[axis] += view[12 + axis];
+    origin = anchorSpace(eye);
+    forward = unit(anchorSpace(direction({std::sin(heading), 0, std::cos(heading)})));
+    right = unit(cross(forward, anchorSpace(direction({0, 1, 0}))));
+    up = cross(right, forward);
+  }
+
+  Vec3 transform(Vec3 point) const {
+    for (unsigned axis = 0; axis < 3; ++axis) point[axis] -= origin[axis];
+    return {dot(point, right), dot(point, up), -dot(point, forward)};
+  }
+};
 
 Vec3 shadeVertex(const replay::DrawPacket &packet, unsigned lane) {
   const auto &v = packet.vertices[lane];
@@ -133,10 +178,7 @@ bool meshPosition(std::span<const uint8_t> bytes,
       eye[row] += weight * (dot(point, {r[0], r[1], r[2]}) + r[3]);
     }
   }
-  const float widescreen = games::mgs::widescreen16x9() ? 0.75f : 1;
-  out = {eye[0] / (gameUnitsPerMetre * widescreen),
-         -eye[1] / (gameUnitsPerMetre * (58.0f / 64.0f)),
-         -eye[2] / gameUnitsPerMetre};
+  out = anchorSpace(eye);
   return std::all_of(out.begin(), out.end(), [](float x) { return std::isfinite(x); });
 }
 
@@ -200,10 +242,19 @@ struct FramePad {
   XrActionSet set = XR_NULL_HANDLE;
   std::array<XrAction, std::size(padBindings)> buttons{};
   XrAction stick = XR_NULL_HANDLE;
+  XrAction turnStick = XR_NULL_HANDLE, aim = XR_NULL_HANDLE;
+  XrSpace aimSpace = XR_NULL_HANDLE;
+  XrVector2f move{};
+  float turn = 0;
+  XrPosef aimPose{};
+  bool aimValid = false, sticksReady = false;
   uint16_t heldThroughFocus = 0xffff;
   bool attached = false;
 
-  ~FramePad() { if (set) xrDestroyActionSet(set); }
+  ~FramePad() {
+    if (aimSpace) xrDestroySpace(aimSpace);
+    if (set) xrDestroyActionSet(set);
+  }
 
   void attach(FrameRuntime &xr) {
     if (!xr.frameController) {
@@ -228,14 +279,18 @@ struct FramePad {
       xrCheck(xrCreateAction(set, &info, &value), "Create MGS pad action");
       return value;
     };
-    std::array<XrActionSuggestedBinding, std::size(padBindings) + 1> bindings{};
+    std::array<XrActionSuggestedBinding, std::size(padBindings) + 3> bindings{};
     for (size_t i = 0; i < buttons.size(); ++i) {
       const auto &item = padBindings[i];
       buttons[i] = action(XR_ACTION_TYPE_BOOLEAN_INPUT, item.name, item.label);
       bindings[i] = {buttons[i], path(item.path)};
     }
     stick = action(XR_ACTION_TYPE_VECTOR2F_INPUT, "move", "Move");
-    bindings.back() = {stick, path("/user/hand/left/input/thumbstick")};
+    turnStick = action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn");
+    aim = action(XR_ACTION_TYPE_POSE_INPUT, "aim", "Aim");
+    bindings[buttons.size()] = {stick, path("/user/hand/left/input/thumbstick")};
+    bindings[buttons.size() + 1] = {turnStick, path("/user/hand/right/input/thumbstick")};
+    bindings[buttons.size() + 2] = {aim, path("/user/hand/right/input/aim/pose")};
     XrInteractionProfileSuggestedBinding suggestion{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     suggestion.interactionProfile = path("/interaction_profiles/valve/frame_controller_valve");
     suggestion.countSuggestedBindings = bindings.size();
@@ -245,12 +300,20 @@ struct FramePad {
     xrCheck(result, "Suggest Steam Frame controller bindings");
     const XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO, nullptr, 1, &set};
     xrCheck(xrAttachSessionActionSets(xr.session, &attach), "Attach MGS controller actions");
+    XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+    space.action = aim;
+    space.poseInActionSpace.orientation.w = 1;
+    xrCheck(xrCreateActionSpace(xr.session, &space, &aimSpace), "Create right controller aim space");
     attached = true;
   }
 
   uint16_t sample(const FrameRuntime &xr, bool focused) {
+    move = {};
+    turn = 0;
+    aimValid = false;
     if (!attached || !focused) {
       heldThroughFocus = 0xffff;
+      sticksReady = false;
       return 0;
     }
     const XrActiveActionSet active{set, XR_NULL_PATH};
@@ -271,7 +334,29 @@ struct FramePad {
     const XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, stick, XR_NULL_PATH};
     XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
     xrCheck(xrGetActionStateVector2f(xr.session, &query, &state), "Read MGS movement stick");
-    if (state.isActive) {
+    const XrActionStateGetInfo turnQuery{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, turnStick, XR_NULL_PATH};
+    XrActionStateVector2f turnState{XR_TYPE_ACTION_STATE_VECTOR2F};
+    xrCheck(xrGetActionStateVector2f(xr.session, &turnQuery, &turnState), "Read MGS turning stick");
+    if (std::hypot(state.currentState.x, state.currentState.y) < 0.25f &&
+        std::abs(turnState.currentState.x) < 0.25f)
+      sticksReady = true;
+    if (sticksReady) {
+      if (state.isActive) move = state.currentState;
+      if (turnState.isActive && std::abs(turnState.currentState.x) > 0.25f)
+        turn = turnState.currentState.x;
+    }
+    const XrActionStateGetInfo aimQuery{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, aim, XR_NULL_PATH};
+    XrActionStatePose aimState{XR_TYPE_ACTION_STATE_POSE};
+    xrCheck(xrGetActionStatePose(xr.session, &aimQuery, &aimState), "Read right controller tracking");
+    if (aimState.isActive) {
+      XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+      xrCheck(xrLocateSpace(aimSpace, xr.space, xr.frameState.predictedDisplayTime, &location),
+              "Locate right controller aim");
+      constexpr auto valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+      aimValid = (location.locationFlags & valid) == valid;
+      if (aimValid) aimPose = location.pose;
+    }
+    if (state.isActive && sticksReady) {
       if (state.currentState.x < -0.37f) pressed |= input::BTN_LEFT;
       if (state.currentState.x > 0.37f) pressed |= input::BTN_RIGHT;
       if (state.currentState.y < -0.37f) pressed |= input::BTN_DOWN;
@@ -311,15 +396,20 @@ struct Renderer::Impl {
   Anchor anchor{};
   GPU::DisplayState display{};
   replay::CrashReplayFramePtr worldFrame;
+  std::optional<PlayerCamera> playerCamera;
   uint64_t revision = UINT64_MAX, builtFrame = UINT64_MAX;
   uint64_t lastWorld = 0, captureAt = 0, submitted = 0;
   uint32_t solidVertices = 0, worldVertices = 0, worldFaces = 0;
   bool canDraw = false, captured = false, cacheBound = false;
+  bool firstPerson = false, switchHeld = false;
+  uint64_t playerEpoch = 0, playerLifetime = 0;
+  float baseHeading = 0, stickTurn = 0;
 
   bool offscreen() const { return !directory.empty(); }
   VkDevice device() const { return xr.device; }
 
   ~Impl() {
+    games::mgs::setVrShotDirection({});
     if (!device()) return;
     vkDeviceWaitIdle(device());
     if (cacheBound) {
@@ -573,6 +663,8 @@ struct Renderer::Impl {
       xr.openOffscreen();
       if (const char *value = std::getenv("PS1_VR_CAPTURE_VBLANK"))
         captureAt = std::stoull(value);
+      if (const char *value = std::getenv("PS1_VR_FIRST_PERSON"))
+        firstPerson = std::strcmp(value, "1") == 0;
       eyes = diagnosticEyes();
     } else {
       xr.open("Midnight Ghost Stone", true);
@@ -648,6 +740,7 @@ struct Renderer::Impl {
       if (world) {
         if (!meshPosition(assets->assets().bytes(), *packet.originalMesh, i, v.position))
           return false;
+        if (playerCamera) v.position = playerCamera->transform(v.position);
       } else {
         constexpr float panelDepth = 2.2f;
         v.position = {float((p.x - aperture.x) / aperture.width - 0.5) * 1.9f,
@@ -724,10 +817,24 @@ struct Renderer::Impl {
     vertices.clear();
     materials.clear();
     transparent.clear();
+    playerCamera.reset();
     worldFaces = solidVertices = worldVertices = 0;
     if (worldFrame && aperture.enabled) {
+      const auto &player = worldFrame->latch().mgsPlayerView;
+      if (firstPerson && player) {
+        if (playerEpoch != player->sceneEpoch || playerLifetime != player->bodyLifetime) {
+          playerEpoch = player->sceneEpoch;
+          playerLifetime = player->bodyLifetime;
+          baseHeading = player->yaw * (2 * std::numbers::pi_v<float> / 4096);
+          stickTurn = 0;
+        }
+        playerCamera.emplace(*player, baseHeading);
+      }
       for (const auto &op : worldFrame->operations()) {
         if (const auto *packet = std::get_if<replay::DrawPacket>(&op); packet && isWorld(*packet)) {
+          const auto &identity = packet->originalMesh->temporalIdentity;
+          if (playerCamera && identity[0] == player->sceneEpoch && identity[1] == player->bodyLifetime)
+            continue;
           if (packet->state.blend.enabled) transparent.push_back(packet);
           else if (addPacket(*packet, aperture, true)) ++worldFaces;
         }
@@ -788,7 +895,10 @@ struct Renderer::Impl {
                               pipelineLayout, 0, 1, &descriptor, 0, nullptr);
       const VkDeviceSize offset = 0;
       vkCmdBindVertexBuffers(xr.commands, 0, 1, &vertexBuffer.buffer, &offset);
-      const auto matrix = eyeMatrix(anchor, views[i]);
+      Anchor renderAnchor = anchor;
+      if (playerCamera)
+        renderAnchor.heading = yaw(2 * std::atan2(anchor.heading[1], anchor.heading[3]) + stickTurn);
+      const auto matrix = eyeMatrix(renderAnchor, views[i]);
       vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                          0, sizeof(matrix), matrix.data());
       const auto draw = [&](VkPipeline pipeline, uint32_t from, uint32_t to) {
@@ -849,19 +959,82 @@ Renderer::Renderer(GPU &gpu, const std::filesystem::path &output)
 }
 Renderer::~Renderer() = default;
 
-bool Renderer::beginFrame(uint16_t &buttons) {
+bool Renderer::beginFrame(input::VrInputSample &sample) {
   auto &state = *impl_;
-  if (state.offscreen()) return true;
+  sample = {};
+  if (state.offscreen()) {
+    if (state.playerCamera && state.worldFrame) {
+      const auto &player = *state.worldFrame->latch().mgsPlayerView;
+      if (const char *heading = std::getenv("PS1_VR_HEADLESS_MOVE_YAW");
+          heading && state.display.latchFrame >= 16028) {
+        const auto stick = input::headRelativeStick(0, 1, std::strtof(heading, nullptr), player.padOrigin);
+        sample.analogMovement = true;
+        sample.x = stick[0];
+        sample.y = stick[1];
+        sample.facing = uint16_t(int32_t(std::lround(std::strtof(heading, nullptr) *
+            (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
+      }
+      if (const char *heading = std::getenv("PS1_VR_HEADLESS_AIM_YAW")) {
+        const float angle = std::strtof(heading, nullptr);
+        games::mgs::setVrShotDirection({std::sin(angle), 0, std::cos(angle)});
+      }
+    }
+    return true;
+  }
   state.canDraw = state.xr.wait(state.eyes);
   const bool focused = state.canDraw && state.xr.state == XR_SESSION_STATE_FOCUSED;
-  buttons = state.pad.sample(state.xr, focused);
+  sample.buttons = state.pad.sample(state.xr, focused);
+  const bool switchPressed = (sample.buttons & input::BTN_R3) != 0;
+  if (switchPressed && !state.switchHeld) {
+    state.firstPerson = !state.firstPerson;
+    state.builtFrame = UINT64_MAX;
+    state.playerEpoch = 0;
+  }
+  state.switchHeld = switchPressed;
+  sample.buttons &= ~input::BTN_R3;
+  games::mgs::setVrShotDirection({});
   if (!state.canDraw) {
     state.xr.end(false);
     return false;
   }
   if (state.xr.needsAnchor) {
     state.anchor = recenter(state.eyes);
-    state.xr.needsAnchor = false;
+    // A standby pose is provisional until the game first gains focus.
+    state.xr.needsAnchor = !focused;
+  }
+  if (focused && state.playerCamera && state.worldFrame) {
+    const auto &player = *state.worldFrame->latch().mgsPlayerView;
+    constexpr float turnSpeed = std::numbers::pi_v<float> / 2;
+    const float period = std::clamp(float(state.xr.frameState.predictedDisplayPeriod) * 1e-9f,
+                                    0.0f, 1.0f / 30);
+    state.stickTurn += state.pad.turn * turnSpeed * period;
+    state.stickTurn = std::remainder(state.stickTurn, 2 * std::numbers::pi_v<float>);
+    const auto head = rotate(inverse(state.anchor.heading),
+        rotate(state.eyes[0].orientation, {0, 0, -1}));
+    const float headTurn = std::atan2(head[0], -head[2]);
+    const float heading = state.baseHeading - state.stickTurn - headTurn;
+    float right = state.pad.move.x, forward = state.pad.move.y;
+    if (std::hypot(right, forward) < 0.25f) {
+      right = float((sample.buttons & input::BTN_RIGHT) != 0) -
+              float((sample.buttons & input::BTN_LEFT) != 0);
+      forward = float((sample.buttons & input::BTN_UP) != 0) -
+                float((sample.buttons & input::BTN_DOWN) != 0);
+    }
+    const auto stick = input::headRelativeStick(right, forward, heading, player.padOrigin);
+    sample.analogMovement = true;
+    sample.x = stick[0];
+    sample.y = stick[1];
+    sample.facing = uint16_t(int32_t(std::lround(heading *
+        (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
+    if (state.pad.aimValid) {
+      const auto &q = state.pad.aimPose.orientation;
+      const auto aim = rotate(inverse(state.anchor.heading),
+                              rotate({q.x, q.y, q.z, q.w}, {0, 0, -1}));
+      const float aimHeading = state.baseHeading - state.stickTurn - std::atan2(aim[0], -aim[2]);
+      const float horizontal = std::hypot(aim[0], aim[2]);
+      games::mgs::setVrShotDirection({std::sin(aimHeading) * horizontal, aim[1],
+                                    std::cos(aimHeading) * horizontal});
+    }
   }
   return focused;
 }
@@ -871,7 +1044,9 @@ void Renderer::present() {
   if (!state.offscreen() && !state.canDraw) return;
   state.updateScene();
   if (state.offscreen()) {
-    if (state.captured || state.worldFaces == 0 || state.builtFrame < state.captureAt) return;
+    if (state.captured || state.worldFaces == 0 || state.builtFrame < state.captureAt ||
+        (state.firstPerson && !state.playerCamera))
+      return;
     std::array<EyeView, 2> coincident{};
     state.drawEyes(coincident);
     state.dump("coincident");
@@ -883,7 +1058,13 @@ void Renderer::present() {
     state.dump("leaned");
     state.captured = true;
     std::cout << "[MGS VR] Captured four eye pairs at VBlank " << state.builtFrame
-              << " from " << state.worldFaces << " original faces\n";
+              << " from " << state.worldFaces << " original faces";
+    if (state.playerCamera) {
+      const auto &player = *state.worldFrame->latch().mgsPlayerView;
+      std::cout << " in first person at (" << player.eye[0] << ", " << player.eye[1]
+                << ", " << player.eye[2] << "), yaw " << player.yaw;
+    }
+    std::cout << '\n';
     return;
   }
   state.drawEyes(state.eyes);
@@ -897,6 +1078,8 @@ void Renderer::rebase() {
   impl_->worldFrame.reset();
   impl_->builtFrame = impl_->revision = UINT64_MAX;
   impl_->lastWorld = 0;
+  impl_->playerEpoch = 0;
+  games::mgs::setVrShotDirection({});
 }
 
 bool Renderer::running() const { return !impl_->xr.finished && !impl_->captured; }

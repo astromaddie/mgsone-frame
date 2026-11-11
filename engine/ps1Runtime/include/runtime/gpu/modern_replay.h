@@ -737,6 +737,16 @@ struct DisplayLatchState {
   bool operator==(const DisplayLatchState &) const = default;
 };
 
+struct MgsPlayerView {
+  uint64_t sceneEpoch = 0;
+  uint64_t bodyLifetime = 0;
+  std::array<float, 3> eye{};
+  std::array<float, 16> sourceView{};
+  uint16_t yaw = 0;
+  uint16_t padOrigin = 0;
+  bool operator==(const MgsPlayerView &) const = default;
+};
+
 // FrameLatch is terminal.  It identifies the complete ordered mutation stream
 // whose result may be presented and supplies already-decoded scanout state.
 struct FrameLatch {
@@ -757,6 +767,7 @@ struct FrameLatch {
   ReplayPolicyState policy;
   DisplayLatchState display;
   uint64_t mgsPhotoCapture = 0;
+  std::optional<MgsPlayerView> mgsPlayerView;
 
   bool operator==(const FrameLatch &) const = default;
 };

@@ -71,6 +71,24 @@ def install(directory, executable, change_overlay=None, overlay_directory=None):
     # USA PCX uploads are synchronous HLE LoadImage calls. Retire precisely
     # their scratch allocation after the original deferred free in a burst.
     data = executable.read_bytes()
+    # Player SOCOM/FAMAS call the retail NewBullet constructor with a local
+    # shot matrix. Keep the complete retail body and patch only that matrix
+    # when the VR host has a tracked aim sample.
+    for pc, expected in ((0x80078DC8, 0x27bdffc8), (0x80067B74, 0x0c01e372),
+                         (0x800682D0, 0x0c01e372)):
+        word, = struct.unpack_from('<I', data, pc - 0x80010000 + 2048)
+        if word != expected:
+            raise ValueError('USA player projectile call identity mismatch')
+    marker = '    PS1_FUNCTION_TRACE_HOOK(ctx, 0x80078DC8u);'
+    owners = [p for p, text in sources.items() if marker in text]
+    if len(owners) != 1:
+        raise ValueError('expected one USA NewBullet binding')
+    p = owners[0]
+    current = edits.get(p, sources[p])
+    hook = ('\n    extern void mgsApplyVrBulletAim(recomp_context*);'
+            '\n    mgsApplyVrBulletAim(ctx);')
+    if marker + hook not in current:
+        edits[p] = current.replace(marker, marker + hook, 1)
     for pc, target in ((0x8002079C, 0x8009259C), (0x800207A8, 0x8009259C),
                        (0x800207B8, 0x800165F8)):
         word, = struct.unpack_from('<I', data, pc - 0x80010000 + 2048)
