@@ -64,6 +64,15 @@ if(MGS_ABI_LIBRARY_DIR)
     set_target_properties(mgsController_tests PROPERTIES SKIP_BUILD_RPATH TRUE)
 endif()
 
+add_executable(mgsVr_tests runtime/test_mgs_vr.cpp runtime/test_stubs.cpp)
+target_link_libraries(mgsVr_tests PRIVATE ps1Runtime_lib GTest::gtest_main)
+gtest_discover_tests(mgsVr_tests)
+if(MGS_ABI_LIBRARY_DIR)
+    target_link_libraries(mgsVr_tests PRIVATE
+        "${MGS_ABI_LIBRARY_DIR}/libm.so.6" "${MGS_ABI_LIBRARY_DIR}/libstdc++.so.6")
+    set_target_properties(mgsVr_tests PROPERTIES SKIP_BUILD_RPATH TRUE)
+endif()
+
 if(NOT WIN32)
 add_executable(ps1Runtime_tests
     runtime/test_stubs.cpp

@@ -8,7 +8,8 @@
 #include <cstring>
 
 namespace {
-std::atomic<uint64_t> vrShotDirection{0};
+std::atomic<uint64_t> vrShotDirection{0}, vrMovement{0};
+constexpr uint64_t movementActive = uint64_t(1) << 63, moveValid = uint64_t(1) << 62, pitchValid = uint64_t(1) << 61;
 
 using ShotVector = std::array<float, 3>;
 float shotDot(const ShotVector &a, const ShotVector &b) {
@@ -21,24 +22,14 @@ ShotVector shotCross(const ShotVector &a, const ShotVector &b) {
 }
 
 namespace ps1::games::mgs {
-void applyVrFacing(Memory &memory, uint16_t heading, const int16_t *aimPitch) {
-  if (memory.read32(0x800AE0A0u) != 0 ||
-      (memory.read32(0x800ADB3Cu) & 0xdc080050u) ||
-      (memory.read32(0x800AE1C8u) & (aimPitch ? 0x20007282u : 0x20007283u)))
-    return;
-  const uint32_t control = memory.read32(0x800AE16Cu);
-  if (control < 0x80010020u || control > 0x801FFF80u)
-    return;
-  const uint32_t name = memory.read32(control - 0x20 + 20);
-  if (name < 0x80010000u || name > 0x801FFFF8u ||
-      std::memcmp(memory.ramPtr() + (name & 0x1fffffffu), "snake.c", sizeof("snake.c")) != 0)
-    return;
-  memory.write16(control + 0x4e, heading & 4095u);
-  if (aimPitch) {
-    memory.write16(control + 8, uint16_t(*aimPitch));
-    memory.write16(control + 10, heading & 4095u);
-    memory.write16(control + 0x4c, uint16_t(*aimPitch));
+void setVrMovement(const input::VrInputSample &sample) noexcept {
+  uint64_t packed = 0;
+  if (sample.facing) {
+    packed = movementActive | (*sample.facing & 4095u);
+    if (sample.movementHeading) packed |= moveValid | (uint64_t(*sample.movementHeading & 4095u) << 12);
+    if (sample.aimPitch) packed |= pitchValid | (uint64_t(uint16_t(*sample.aimPitch)) << 24);
   }
+  vrMovement.store(packed, std::memory_order_release);
 }
 
 void setVrShotDirection(const std::array<float, 3> &direction) noexcept {
@@ -52,6 +43,72 @@ void setVrShotDirection(const std::array<float, 3> &direction) noexcept {
   }
   vrShotDirection.store(packed, std::memory_order_relaxed);
 }
+}
+
+namespace {
+bool vrSnake(ps1::Memory &memory, uint32_t actor, uint64_t sample) {
+  if (!(sample & movementActive) || actor < 0x80010000u || actor > 0x801FF500u ||
+      memory.read32(0x800AE16Cu) != actor + 0x20 || memory.read32(0x800AE0A0u) != 0 ||
+      (memory.read32(0x800ADB3Cu) & 0xdc080050u) ||
+      (memory.read32(0x800AE1C8u) & ((sample & pitchValid) ? 0x20007282u : 0x20007283u))) return false;
+  const auto name = memory.read32(actor + 20);
+  if (name < 0x80010000u || name > 0x801FFFF8u ||
+      std::memcmp(memory.ramPtr() + (name & 0x1fffffffu), "snake.c", sizeof("snake.c"))) return false;
+  // USA idle/crouch/prone/run and run-start handlers. Damage, wall presses,
+  // ladders, dragging, scripted motion and weapon-specific stances stay native.
+  const uint32_t handler = memory.read32(actor + 0x9c4);
+  return handler == 0x80054854u || handler == 0x800549D8u || handler == 0x80054B50u ||
+         handler == 0x80054C6Cu || handler == 0x80054E80u || handler == 0x80055B6Cu;
+}
+void vrFacing(ps1::Memory &memory, uint32_t control, uint64_t sample) {
+  const uint16_t heading = sample & 4095u;
+  memory.write16(control + 10, heading);
+  memory.write16(control + 0x4e, heading);
+  if (sample & pitchValid) {
+    const uint16_t pitch = sample >> 24;
+    memory.write16(control + 8, pitch);
+    memory.write16(control + 0x4c, pitch);
+  }
+}
+}
+
+void mgsApplyVrLocomotion(recomp_context *ctx) {
+  if (!ctx || !ctx->mem) return;
+  const auto sample = vrMovement.load(std::memory_order_acquire);
+  const uint32_t actor = ctx->r18; // USA main logic keeps Snake in s2.
+  auto &memory = *ctx->mem;
+  if (!vrSnake(memory, actor, sample) || ctx->r28 + 0x920 < 0x80010000u ||
+      ctx->r28 + 0x920 > 0x801FFFFCu) return;
+  // The original pad and wall-direction checks have already run. Let the
+  // normal animation state machine see movement along the facing direction,
+  // avoiding its turn-around/start delay for backwards and lateral input.
+  const uint32_t direction = ctx->r28 + 0x920;
+  if (int32_t(memory.read32(direction)) >= 0 && (sample & moveValid))
+    memory.write32(direction, sample & 4095u);
+  vrFacing(memory, actor + 0x20, sample);
+}
+
+void mgsApplyVrControl(recomp_context *ctx) {
+  // This is the actual Snake call to GM_ActControl, after root animation has
+  // produced step and before CheckCollide/CheckHeight consume it.
+  if (!ctx || !ctx->mem || ctx->r31 != 0x8005D0FCu) return;
+  const auto sample = vrMovement.load(std::memory_order_acquire);
+  const auto control = ctx->r4;
+  auto &memory = *ctx->mem;
+  if (!vrSnake(memory, control - 0x20, sample)) return;
+  if (sample & moveValid) {
+    const float x = int16_t(memory.read16(control + 0x44));
+    const float z = int16_t(memory.read16(control + 0x48));
+    const float speed = std::hypot(x, z);
+    const float angle = float((sample >> 12) & 4095u) * (2 * 3.14159265358979323846f / 4096);
+    memory.write16(control + 0x44, uint16_t(int16_t(std::lround(std::sin(angle) * speed))));
+    memory.write16(control + 0x48, uint16_t(int16_t(std::lround(std::cos(angle) * speed))));
+  }
+  vrFacing(memory, control, sample);
+  ps1::metrics::trace("mgs.vr.control", {{"facing", int64_t(sample & 4095u)},
+      {"move", (sample & moveValid) ? int64_t((sample >> 12) & 4095u) : -1},
+      {"step_x", int16_t(memory.read16(control + 0x44))},
+      {"step_z", int16_t(memory.read16(control + 0x48))}});
 }
 
 void mgsApplyVrBulletAim(recomp_context *ctx) {

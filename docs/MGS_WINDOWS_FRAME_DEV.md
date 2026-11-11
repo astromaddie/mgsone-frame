@@ -144,8 +144,22 @@ Clang 18 finished the replacement support file and link in 9 minutes; the
 earlier support compile was still running when I stopped it after 43 minutes.
 The shared PC load differed, so those times aren't a controlled speed comparison.
 
-The project build is a smoke check only. Launch, controller input, Vulkan and
-performance still need their own Frame runs.
+`frame-smoke` checks configuration and linking. `frame-runtime` builds the
+retail game; controller input, Vulkan and cadence need their own Frame runs.
+
+To build the standalone ARM64 checks, enable tests in the existing runtime
+build folder and defer discovery until the tests run on the target:
+
+```sh
+cmake -S engine -B /home/astro/MGSOneFrameDev/build/frame-runtime \
+  -DPS1RECOMP_BUILD_TESTS=ON \
+  -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+cmake --build /home/astro/MGSOneFrameDev/build/frame-runtime \
+  --target mgsVr_tests mgsController_tests ps1Runtime_tests --parallel 2
+```
+
+Run those binaries on the Frame. Copy `ps1Test/gamecontrollerdb.txt` beside
+`mgsController_tests`; its mapping checks use the real bundled database.
 
 ## What I Checked
 
@@ -172,3 +186,12 @@ private game data. I keep the resulting binary and its shaders in
 ELF links against Frame `libSDL2-2.0.so.0`, `libvulkan.so.1`, libc, libgcc_s,
 libm and libstdc++; Frame accepts its requirements through GLIBC 2.43,
 GLIBCXX 3.4.32, CXXABI 1.3.13 and GCC 4.5.0.
+
+I also cross-built the retail USA campaign with the native host generators.
+Its runtime SHA-256 is
+`212d5898a84cd72a3d2016ea6e83c5c400eec720794f2f7b9966704ef89640af`.
+The ELF passed the Frame sysroot check and ran its game captures on Turnip.
+The Frame passed 14 VR checks, 1,366 runtime checks with 32 optional skips,
+and 25 controller checks. [VR Architecture](VR_ARCHITECTURE.md) records the
+menu, body, wall, movement and native shot inputs and results. The final
+retail package lives in `artifacts/frame-retail` on the D-backed workspace.

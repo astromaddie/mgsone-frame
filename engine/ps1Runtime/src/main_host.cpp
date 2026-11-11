@@ -2397,9 +2397,7 @@ int main(int argc, char *argv[]) {
       if (!tas.active()) {
         if (inputScriptEnabled)
           inputScript.apply(newCount, input);
-        if (mgsVr && vrInput.facing)
-          ps1::games::mgs::applyVrFacing(memory, *vrInput.facing,
-                                        vrInput.aimPitch ? &*vrInput.aimPitch : nullptr);
+        if (mgsVr) ps1::games::mgs::setVrMovement(vrInput);
         input.latchVBlank();
       }
       if (!mgsProfile) {

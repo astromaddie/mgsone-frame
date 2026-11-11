@@ -16,8 +16,9 @@ class DecompBridgeTests(unittest.TestCase):
             f'void func_{pc:08X}(uint8_t *ram, recomp_context *ctx) {{\n'
             f'    PS1_FUNCTION_TRACE_HOOK(ctx, 0x{pc:08X}u);\n'
             '    const bool restored = ctx->nativeResumePc != 0;\n}\n'
-            for pc in (*bridges.ENTRIES, 0x80024A64, 0x80078DC8)) +
-            '\n    PS1_PC_TRACE_HOOK(ctx, 0x800207C0u);\n')
+            for pc in (*bridges.ENTRIES, 0x80024A64, 0x80078DC8, 0x80026FA4)) +
+            '\n    PS1_PC_TRACE_HOOK(ctx, 0x800207C0u);\n'
+            '    PS1_PC_TRACE_HOOK(ctx, 0x8005CAB4u);\n')
         return path
 
     def test_wrong_executable_never_modifies_generated_code(self):
@@ -44,6 +45,8 @@ class DecompBridgeTests(unittest.TestCase):
             self.assertEqual(installed.count('if (mgsTryFastStageSync('), 1)
             self.assertEqual(installed.count('mgsReleaseFastPcxScratch(ctx);'), 1)
             self.assertEqual(installed.count('mgsApplyVrBulletAim(ctx);'), 1)
+            self.assertEqual(installed.count('mgsApplyVrControl(ctx);'), 1)
+            self.assertEqual(installed.count('mgsApplyVrLocomotion(ctx);'), 1)
             self.assertEqual(bridges.install(root, exe), 0)
             self.assertEqual(source.read_text(), installed)
             source.write_text(installed.replace('0x8001E378u);', '0x8001E370u);', 1))

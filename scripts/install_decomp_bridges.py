@@ -89,6 +89,25 @@ def install(directory, executable, change_overlay=None, overlay_directory=None):
             '\n    mgsApplyVrBulletAim(ctx);')
     if marker + hook not in current:
         edits[p] = current.replace(marker, marker + hook, 1)
+    # USA Snake's animation callback and the real collision-control entry.
+    # Hash the retail image first, then check the concrete ABI witnesses.
+    for pc, expected in ((0x80026FA4, 0x27bdffa8), (0x8005D0F4, 0x0c009be9),
+                         (0x8005D0F8, 0x26240020), (0x8005CAB4, 0x02402021),
+                         (0x8005CAF4, 0x0040f809), (0x8005491C, 0x8f820920)):
+        word, = struct.unpack_from('<I', data, pc - 0x80010000 + 2048)
+        if word != expected:
+            raise ValueError('USA VR locomotion boundary identity mismatch')
+    for kind, pc, function in (('FUNCTION', 0x80026FA4, 'mgsApplyVrControl'),
+                                ('PC', 0x8005CAB4, 'mgsApplyVrLocomotion')):
+        marker = f'    PS1_{kind}_TRACE_HOOK(ctx, 0x{pc:08X}u);'
+        owners = [p for p, text in sources.items() if marker in text]
+        if len(owners) != 1:
+            raise ValueError(f'expected one USA VR {function} boundary')
+        p = owners[0]
+        current = edits.get(p, sources[p])
+        hook = f'\n    extern void {function}(recomp_context*);\n    {function}(ctx);'
+        if marker + hook not in current:
+            edits[p] = current.replace(marker, marker + hook, 1)
     for pc, target in ((0x8002079C, 0x8009259C), (0x800207A8, 0x8009259C),
                        (0x800207B8, 0x800165F8)):
         word, = struct.unpack_from('<I', data, pc - 0x80010000 + 2048)

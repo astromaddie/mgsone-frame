@@ -232,6 +232,7 @@ void applySourceGeometry(gpu::replay::DrawPacket &packet, const Face &face) {
   packet.state.depth.compare = gpu::replay::DepthCompare::Always;
   packet.state.depth.invalidateOnAccepted = packet.state.blend.enabled;
 }
+} // namespace
 std::optional<gpu::replay::MgsPlayerView>
 capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   // USA v1.0 witnesses from the live player control and the Snake actor.
@@ -246,8 +247,7 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   constexpr uint32_t authoredGameView = 0xdc080050;
   const bool weaponView = (status & 1u) && int16_t(memory.read16(0x800B752Cu)) >= 0;
   const uint32_t playerViewMask = weaponView ? authoredPlayerView & ~1u : authoredPlayerView;
-  if ((status & playerViewMask) || (memory.read32(gameStatus) & authoredGameView) ||
-      memory.read32(0x800AE0A0u) != 0)
+  if ((status & playerViewMask) || memory.read32(0x800AE0A0u) != 0)
     return {};
   const uint32_t control = memory.read32(playerControl);
   if (control < 0x80010000u || !range(control, bodyPointerOffset + 4))
@@ -257,20 +257,39 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
       std::memcmp(memory.ramPtr() + (actorName & 0x1fffffffu),
                   "snake.c", sizeof("snake.c")) != 0)
     return {};
+  // STATE_BEHIND_CAMERA is also the ordinary wall-press camera, not only an
+  // authored view. Keep it in-world only for authenticated retail Snake wall
+  // idle/move/crouch callbacks plus PLAYER_CAUTION. Native controls still own
+  // those actions; the locomotion bridge deliberately does not override them.
+  if (!range(control - controlOffset, 0x9c8)) return {};
+  const uint32_t handler = memory.read32(control - controlOffset + 0x9c4);
+  const bool wallView = (status & 0x10000u) &&
+      (handler == 0x80055040u || handler == 0x80055134u || handler == 0x800552B8u);
+  const uint32_t gameViewMask = wallView ? authoredGameView & ~0x10u : authoredGameView;
+  if (memory.read32(gameStatus) & gameViewMask) return {};
   const uint32_t body = memory.read32(control + bodyPointerOffset);
   const auto instance = std::find_if(scene.instances.begin(), scene.instances.end(),
       [&](const auto &item) { return item.guestAddress == body; });
   if (instance == scene.instances.end() || !instance->visible ||
       instance->models.size() <= headModel)
     return {};
-  const float y = instance->models[headModel].world[13] + ((status & 0x40u) ? 320.0f : 0.0f);
+  // Model 6's origin is the head/neck joint, inside the collar, not the eyes.
+  // The native head spans local Y=-60..165 and Z=-90..93 game units. Place
+  // the eyes 100mm above and 60mm toward the face, within that head volume.
+  // Use the same presentation pose as source geometry so float articulation
+  // cannot leave the camera at a different native joint position.
+  const auto &head = instance->models[headModel].presentationWorld;
+  std::array<float, 3> eye{};
+  for (unsigned axis = 0; axis < 3; ++axis)
+    eye[axis] = head[12 + axis] + 100.0f * head[4 + axis] + 60.0f * head[8 + axis];
+  if (status & 0x40u) eye[1] += 320.0f;
   return gpu::replay::MgsPlayerView{
-      scene.epoch, instance->lifetime,
-      {float(int16_t(memory.read16(control))), y, float(int16_t(memory.read16(control + 4)))},
+      scene.epoch, instance->lifetime, eye,
       scene.view, uint16_t(memory.read16(control + 10) & 4095u),
       uint16_t(memory.read32(0x800ADAA8u) & 4095u)};
 }
 
+namespace {
 void prepareFullSourceMeshes(const SceneSnapshot &scene, const Memory &memory,
                              RecoverySource &out) {
   if (scene.bufferIndex > 1 || scene.projection <= 0 || scene.clip[2] <= 0 ||

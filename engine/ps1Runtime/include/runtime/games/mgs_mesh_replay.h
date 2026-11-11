@@ -13,6 +13,9 @@ struct DrawPacket;
 namespace ps1::games::mgs {
 struct SceneSnapshot;
 struct SceneInstance;
+// Authenticate the live playable Snake view for source-mesh VR presentation.
+std::optional<gpu::replay::MgsPlayerView>
+capturePlayerView(const SceneSnapshot &scene, const Memory &memory);
 // Material adapter only. Geometry, normals and UV topology are read from the
 // original resource; live state supplies lights, palette and actor overrides.
 std::optional<gpu::replay::DrawPacket>
