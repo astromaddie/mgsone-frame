@@ -1,4 +1,7 @@
 #include "runtime/gpu/renderer_vulkan.h"
+#ifdef PS1_MGS_OPENXR
+#include "../vr/mgs_vr.h"
+#endif
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_vulkan.h>
@@ -810,6 +813,9 @@ void traceReplayVisibilityOwner(uint64_t guestFrame, uint32_t ownerToken,
 } // namespace
 
 struct RendererVulkan::Impl {
+#ifdef PS1_MGS_OPENXR
+  std::unique_ptr<vr::Renderer> mgsVr;
+#endif
   enum class ReplayDiagnosticPresentation : uint8_t {
     Ordinary = 0,
     TemporalMidpoint,
@@ -29162,6 +29168,16 @@ RendererVulkan::~RendererVulkan() { destroy(); }
 bool RendererVulkan::init(const std::string &windowTitle, int width, int height,
                           bool vsync, bool fullscreen) {
   try {
+    if (options_.mgsVr) {
+#ifdef PS1_MGS_OPENXR
+      impl_ = std::make_unique<Impl>();
+      impl_->mgsVr = std::make_unique<vr::Renderer>(gpu_, options_.mgsVrCaptureDirectory);
+      healthy_ = true;
+      return true;
+#else
+      throw std::runtime_error("This build does not include MGS OpenXR support");
+#endif
+    }
     if ((SDL_WasInit(SDL_INIT_VIDEO) & SDL_INIT_VIDEO) == 0) {
       if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
         throw std::runtime_error(std::string("SDL video init: ") +
@@ -29265,10 +29281,34 @@ void RendererVulkan::setHostController(_SDL_GameController *controller) {
                                 controller ? &controller : nullptr, controller ? 1 : 0);
 }
 
+bool RendererVulkan::beginVrFrame(uint16_t &buttons) {
+  buttons = 0;
+#ifdef PS1_MGS_OPENXR
+  if (impl_ && impl_->mgsVr && healthy_) {
+    try {
+      return impl_->mgsVr->beginFrame(buttons);
+    } catch (const std::exception &error) {
+      fmt::print(stderr, "[MGS VR] frame start failed: {}\n", error.what());
+      healthy_ = false;
+      return false;
+    }
+  }
+#endif
+  return healthy_;
+}
+
 void RendererVulkan::renderFrame() {
-  if (impl_ == nullptr || window_ == nullptr)
+  if (!impl_ || !healthy_)
     return;
   try {
+#ifdef PS1_MGS_OPENXR
+    if (impl_->mgsVr) {
+      impl_->mgsVr->present();
+      return;
+    }
+#endif
+    if (window_ == nullptr)
+      return;
     if (impl_->hostUiInitialized) {
       ImGui_ImplVulkan_NewFrame();
       ImGui_ImplSDL2_NewFrame();
@@ -29411,6 +29451,12 @@ void RendererVulkan::rebaseGuestTimeline() {
     uint64_t discardedFrames = 0;
     while (gpu_.tryConsumeReplay())
       ++discardedFrames;
+#ifdef PS1_MGS_OPENXR
+    if (impl_->mgsVr) {
+      impl_->mgsVr->rebase();
+      return;
+    }
+#endif
     impl_->rebaseGuestTimeline();
     ps1::metrics::count("host.renderer.vulkan_replay_timeline_discarded_frames",
                         discardedFrames);
@@ -29428,6 +29474,10 @@ void RendererVulkan::rebaseGuestTimeline() {
 
 bool RendererVulkan::processEvents() {
   // main_host owns SDL_PollEvent so the renderer never consumes input/quit.
+#ifdef PS1_MGS_OPENXR
+  if (impl_ && impl_->mgsVr)
+    return healthy_ && impl_->mgsVr->running();
+#endif
   return impl_ != nullptr && healthy_;
 }
 
@@ -29437,6 +29487,9 @@ VulkanReplayCapabilityAssessment RendererVulkan::replayCapability() const {
 }
 
 void RendererVulkan::drainReplayDiagnostics() {
+#ifdef PS1_MGS_OPENXR
+  if (impl_ && impl_->mgsVr) return;
+#endif
   if (impl_ != nullptr) {
     impl_->drainReplayDiagnosticReadbacks();
     impl_->drainGpuTimingReport();
@@ -29445,6 +29498,12 @@ void RendererVulkan::drainReplayDiagnostics() {
 
 void RendererVulkan::destroy() {
   healthy_ = false;
+#ifdef PS1_MGS_OPENXR
+  if (impl_ && impl_->mgsVr) {
+    impl_.reset();
+    return;
+  }
+#endif
   if (impl_ != nullptr) {
     impl_->destroy();
     impl_.reset();

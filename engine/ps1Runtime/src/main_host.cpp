@@ -519,8 +519,20 @@ int main(int argc, char *argv[]) {
   std::string input_path;
   std::string explicit_disc_path;
   std::string config_path;
+  bool mgsVr = false;
+  std::string vrCaptureDirectory;
   for (int i = 1; i < argc; i++) {
-    if (std::string(argv[i]) == "--config" && i + 1 < argc) {
+    const std::string_view arg = argv[i];
+    if (arg == "--vr") {
+      mgsVr = true;
+    } else if (arg == "--vr-headless") {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+        fmt::print(stderr, "--vr-headless requires a capture directory\n");
+        return 1;
+      }
+      mgsVr = true;
+      vrCaptureDirectory = argv[++i];
+    } else if (arg == "--config" && i + 1 < argc) {
       config_path = argv[++i];
     } else if (input_path.empty()) {
       input_path = argv[i];
@@ -568,6 +580,10 @@ int main(int argc, char *argv[]) {
   }
   ps1::games::crash3::ProfileOptions crash3Profile;
   const bool mgsProfile = runtimeConfig.game.profile == ps1::games::mgs::PROFILE_NAME;
+  if (mgsVr && !mgsProfile) {
+    fmt::print(stderr, "The VR renderer requires the MGS USA game profile\n");
+    return 1;
+  }
   ps1::games::mgs::configure(mgsProfile, runtimeConfig.game.widescreen16x9);
   if (!runtimeConfig.game.profile.empty() && !mgsProfile) {
     if (runtimeConfig.game.profile != ps1::games::crash3::PROFILE_NAME) {
@@ -973,13 +989,17 @@ int main(int argc, char *argv[]) {
     return value != nullptr && *value != '\0' && *value != '0' &&
            std::strcmp(value, "off") != 0;
   }();
+  if (diagnosticHeadless && mgsVr) {
+    fmt::print(stderr, "Use --vr-headless for GPU eye captures or PS1_DIAGNOSTIC_HEADLESS for CPU tests\n");
+    return 1;
+  }
 
-  // Initialize SDL2. The headless path has no video dependency; controller
-  // events and dummy/real audio retain the same subsystem contracts as an
+  // Initialize SDL2. The headless and OpenXR paths have no SDL video window;
+  // controller events and audio retain the same subsystem contracts as an
   // interactive run.
   const uint32_t sdlSubsystems =
       SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER |
-      (diagnosticHeadless ? 0u : static_cast<uint32_t>(SDL_INIT_VIDEO));
+      (diagnosticHeadless || mgsVr ? 0u : static_cast<uint32_t>(SDL_INIT_VIDEO));
   ps1::input::ControllerHub::configureBeforeSDL();
   if (SDL_Init(sdlSubsystems) < 0) {
     fmt::print(stderr, "SDL_Init failed: {}\n", SDL_GetError());
@@ -996,6 +1016,8 @@ int main(int argc, char *argv[]) {
   // Initialize the sole supported video backend. OpenGL and CPU 4x
   // presentation are intentionally not fallback paths.
   ps1::gpu::RendererOptions rendererOptions;
+  rendererOptions.mgsVr = mgsVr;
+  rendererOptions.mgsVrCaptureDirectory = std::move(vrCaptureDirectory);
   rendererOptions.displayAreaPolicy = *displayAreaPolicy;
   rendererOptions.displaySignalProfile = *displaySignalProfile;
   rendererOptions.preserveAspect = runtimeConfig.video.preserveAspect;
@@ -1313,7 +1335,8 @@ int main(int argc, char *argv[]) {
         .string();
   };
   ps1::input::HostInput hostInput;
-  const bool playerHostUi = mgsProfile && !tas.enabled() && !ignoreDiagnosticInput;
+  const bool managedInput = mgsProfile && !tas.enabled() && !ignoreDiagnosticInput;
+  const bool playerHostUi = managedInput && !mgsVr;
   bool hostMenu = false, hostMenuFocus = false, confirmQuit = false;
   bool hostAudioPaused = false;
   std::string recoveryNotice;
@@ -1878,7 +1901,7 @@ int main(int argc, char *argv[]) {
                    event.key.repeat == 0) {
           renderer.toggleDepthVisualization();
         } else {
-          if (playerHostUi) {
+          if (managedInput) {
             const auto key = keyboardMap.find(event.key.keysym.sym);
             if (!hostMenu && key != keyboardMap.end())
               ps1::input::HostInput::button(hostInput.keyboard, key->second, true);
@@ -1887,7 +1910,7 @@ int main(int argc, char *argv[]) {
         }
         break;
       case SDL_KEYUP:
-        if (playerHostUi) {
+        if (managedInput) {
           const auto key = keyboardMap.find(event.key.keysym.sym);
           if (key != keyboardMap.end()) ps1::input::HostInput::button(hostInput.keyboard, key->second, false);
         } else if (!ignoreDiagnosticInput && !tas.replaying())
@@ -1897,9 +1920,9 @@ int main(int argc, char *argv[]) {
       case SDL_CONTROLLERBUTTONUP: {
         if (ignoreDiagnosticInput || tas.replaying())
           break;
-        if (playerHostUi) {
+        if (managedInput) {
           if (!gamepad || event.cbutton.which != SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gamepad))) break;
-          if (event.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
+          if (playerHostUi && event.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
             if (event.type == SDL_CONTROLLERBUTTONDOWN) showHostMenu(!hostMenu);
           }
           break;
@@ -1916,7 +1939,7 @@ int main(int argc, char *argv[]) {
       case SDL_CONTROLLERAXISMOTION: {
         if (ignoreDiagnosticInput || tas.replaying())
           break;
-        if (playerHostUi) break; // sampled once from the selected controller below
+        if (managedInput) break; // sampled once from the selected controller below
         const auto axis = static_cast<SDL_GameControllerAxis>(event.caxis.axis);
         if (axis >= 0 && axis < SDL_CONTROLLER_AXIS_MAX)
           gamepadAxes[axis] = event.caxis.value;
@@ -2089,6 +2112,23 @@ int main(int argc, char *argv[]) {
         if (!renderer.processEvents()) running = false;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(16));
+      continue;
+    }
+    uint16_t vrButtons = 0;
+    const bool vrFocused = !mgsVr || renderer.beginVrFrame(vrButtons);
+    if (mgsVr && managedInput) {
+      const auto pad = controllers.gameplay(!vrFocused);
+      hostInput.gamepad = pad.buttons | vrButtons;
+      hostInput.axes = pad.axes;
+      hostInput.deadzone = controllers.deadzone();
+      hostInput.apply(input, !vrFocused);
+    }
+    if (!vrFocused) {
+      if (!hostAudioPaused && audioDevice > 0) SDL_PauseAudioDevice(audioDevice, 1);
+      hostAudioPaused = true;
+      scheduledVblanks.store(processedVblanks, std::memory_order_release);
+      renderer.renderFrame();
+      if (!renderer.processEvents()) running = false;
       continue;
     }
     if (hostAudioPaused) {
@@ -2483,6 +2523,7 @@ int main(int argc, char *argv[]) {
       if (soak.enabled()) soak.presented(!diagnosticHeadless,
           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-presentStart).count());
     } else {
+      if (mgsVr) renderer.renderFrame();
       // Swap interval is not guaranteed (headless drivers and some compositors
       // ignore it). Avoid a busy present loop while waiting for the next
       // guest master-clock edge.
@@ -2644,7 +2685,8 @@ int main(int argc, char *argv[]) {
 
   // Cleanup
 
-  const int resultCode = gameThreadFailed ? 46 : (soak.enabled() && !soak.passed()) ? 47 : (hostProbe && (!hostProbePassed || hostProbeFailed)) ? 44 :
+  const int resultCode = (mgsVr && !renderer.healthy()) ? 48 :
+      gameThreadFailed ? 46 : (soak.enabled() && !soak.passed()) ? 47 : (hostProbe && (!hostProbePassed || hostProbeFailed)) ? 44 :
       tas.failed() || tasIncomplete ? 42 :
       (tasRouteEnabled && (tasRoute.failed() || !tasRoute.done()) ? 43 : 0);
   if (tasRouteEnabled)

@@ -124,6 +124,11 @@ set(PS1RECOMP_VULKAN_SHADER_SOURCES
     "${PS1RECOMP_VULKAN_SHADER_SOURCE_DIR}/replay_visibility_owner.frag"
     "${PS1RECOMP_VULKAN_SHADER_SOURCE_DIR}/replay_visibility_stack.frag"
 )
+if(MGS_STEAM_FRAME_VR)
+    list(APPEND PS1RECOMP_VULKAN_SHADER_SOURCES
+        "${PS1RECOMP_VULKAN_SHADER_SOURCE_DIR}/vr/mgs_scene.vert"
+        "${PS1RECOMP_VULKAN_SHADER_SOURCE_DIR}/vr/mgs_scene.frag")
+endif()
 file(MAKE_DIRECTORY "${PS1RECOMP_VULKAN_SHADER_BINARY_DIR}")
 
 set(PS1RECOMP_VULKAN_SHADER_BINARIES)
@@ -413,6 +418,11 @@ target_link_libraries(ps1Runtime_vulkan_renderer
 target_compile_definitions(ps1Runtime_vulkan_renderer PRIVATE
     PS1RECOMP_VULKAN_SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders"
 )
+if(MGS_STEAM_FRAME_VR)
+    target_sources(ps1Runtime_vulkan_renderer PRIVATE src/vr/mgs_vr.cpp)
+    target_compile_definitions(ps1Runtime_vulkan_renderer PRIVATE PS1_MGS_OPENXR)
+    target_link_libraries(ps1Runtime_vulkan_renderer PRIVATE OpenXR::openxr_loader)
+endif()
 
 add_executable(ps1Runtime
     src/main_host.cpp

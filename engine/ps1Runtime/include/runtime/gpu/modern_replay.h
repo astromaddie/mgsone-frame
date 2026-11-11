@@ -517,6 +517,7 @@ struct OriginalMeshGeometry {
   bool runtimeTexture =
       false; // verified actor-owned surface, composed in the mutable atlas
   bool thermalEmission = false; // live STATE_THERMG plus DG_FLAG_IRTEXTURE
+  bool stereoCullBack = false; // single-sided source mesh in the stereo capture
   OriginalMeshLighting lighting;
   std::array<std::array<float, 4>, 4> weights{
       {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}}};

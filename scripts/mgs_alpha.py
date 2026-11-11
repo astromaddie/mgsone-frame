@@ -393,7 +393,9 @@ def metadata(root=ROOT):
     return json.loads(p.read_text())
 
 
-def launch(paths, root=ROOT, reference=False, headless_frames=0, progress=print, big_picture=False):
+def launch(paths, root=ROOT, reference=False, headless_frames=0, progress=print, big_picture=False, vr=False):
+    if vr and (reference or headless_frames):
+        raise ValueError('VR requires the original mesh renderer and an OpenXR session.')
     with user_lock(paths) as profile_lock:
         media,_ = installed(paths)
         options=settings(paths)
@@ -420,10 +422,14 @@ def launch(paths, root=ROOT, reference=False, headless_frames=0, progress=print,
               PS1_VBLANK_PERIOD_US='1000',SDL_AUDIODRIVER='dummy',SDL_VIDEODRIVER='dummy')
         logs=paths.data/'logs';logs.mkdir(exist_ok=True)
         fd,logpath=tempfile.mkstemp(prefix=time.strftime('session-%Y%m%d-%H%M%S-'),suffix='.log',dir=logs)
-        progress('Game started. R3 / Esc pause menu · F5 save · F9 load · F11 fullscreen')
+        args = [str(runtime), '--config', str(config)]
+        if vr:
+            args.append('--vr')
+        progress('Starting MGS in VR.' if vr else
+                 'Game started. R3 / Esc pause menu · F5 save · F9 load · F11 fullscreen')
         start=time.monotonic()
         with os.fdopen(fd,'wb') as out:
-            completed=run_runtime([str(runtime),'--config',str(config)],cwd=root,env=env,
+            completed=run_runtime(args,cwd=root,env=env,
                 stdout=out,stderr=subprocess.STDOUT,pass_fds=(profile_lock.fileno(),))
         atomic_json(logs/'last-session.json',dict(schema=1,version=metadata(root)['version'],
           runtime_sha256=digest(runtime),returncode=completed.returncode,
@@ -593,6 +599,7 @@ def _main(argv=None):
     imp=sub.add_parser('import');imp.add_argument('disc1',type=Path);imp.add_argument('disc2',type=Path)
     sub.add_parser('verify');sub.add_parser('paths');sub.add_parser('gui')
     run=sub.add_parser('run');run.add_argument('--reference',action='store_true');run.add_argument('--headless-frames',type=int,default=0)
+    run.add_argument('--vr',action='store_true')
     cfg=sub.add_parser('settings');cfg.add_argument('--height',type=int,choices=HEIGHTS);cfg.add_argument('--volume',type=int)
     for name in ('fullscreen','vsync','mute','fast-loading','ambient-occlusion'):cfg.add_argument('--'+name,action=argparse.BooleanOptionalAction,default=None)
     for name in ('backup','diagnostics'):
@@ -605,7 +612,7 @@ def _main(argv=None):
         elif args.command=='gui':gui(paths)  # optional legacy desktop editor
         elif args.command=='import':import_discs(paths,[args.disc1,args.disc2])
         elif args.command=='verify':installed(paths,full=True);print('Both discs, executable, cues and asset cache verified.')
-        elif args.command=='run':launch(paths,reference=args.reference,headless_frames=args.headless_frames,big_picture=args.big_picture)
+        elif args.command=='run':launch(paths,reference=args.reference,headless_frames=args.headless_frames,big_picture=args.big_picture,vr=args.vr)
         elif args.command=='paths':print(json.dumps(dict(data=str(paths.data),config=str(paths.config)),indent=2))
         elif args.command=='settings':
             value=settings(paths)

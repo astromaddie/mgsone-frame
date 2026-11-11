@@ -47,6 +47,48 @@ three 512×512 images per eye, and accepted one red-left, blue-right projection
 frame before the session stopped. This checks the Vulkan binding and submission
 path. It does not check the appearance of the game in stereo.
 
-After the flat gameplay gate, compare the opening dock's original view with
-identical eyes, then check both eyes at several yaw angles for missing draws
-and depth conflicts before enabling the tracked camera for play.
+## Game renderer
+
+`MGS_STEAM_FRAME_VR` builds the eye renderer. Run the game with `--vr`
+to use the original scene snapshots. The renderer expands the original
+geometry once for both eyes and draws it through two depth-tested,
+asymmetric projections. The opening view follows the original third-person
+camera. Tracked position and orientation are relative to the first valid
+head position and heading. The current scale is 1,000 game units per metre.
+
+The native scanout supplies a fixed cinema panel for the title screen,
+video and Codec. In the world, legacy 2D packets supply the initial HUD.
+Scene effects that depend on the flat renderer's feedback or temporal
+history still need eye-local implementations.
+
+## Headless dock capture
+
+Use the scripted dock checkpoint in [Steam Frame](STEAM_FRAME.md). Restore
+the state in the same isolated profile and point `PS1_MGS_ASSET_CACHE` at the
+imported `assets.mgsc`:
+
+```sh
+SDL_AUDIODRIVER=dummy PS1_DIAGNOSTIC_IGNORE_INPUT=1 \
+PS1_MGS_ASSET_CACHE="$media/assets.mgsc" PS1_AUTOLOAD_VBLANK=1 \
+PS1_EXIT_AFTER_LOAD_VBLANKS=120 PS1_VR_CAPTURE_VBLANK=16025 \
+build/ps1Runtime/ps1Runtime --config "$profile/runtime.toml" --vr-headless "$capture"
+```
+
+The capture writes two 768×768 PPMs per pose from a single dock snapshot.
+Compare the identical-pose pair byte for byte. The forward pair has a
+64 mm eye separation. The other pairs add a 0.45 radian yaw and a 12 cm
+lateral head movement, respectively. Check the scene at each pose for
+geometry gaps and depth conflicts. This test uses Vulkan directly and
+leaves SteamVR idle.
+
+On 2026-11-11, Turnip rendered the USA v1.0 dock at VBlank 16025 from
+2,698 original faces. The coincident eyes matched byte for byte. With a
+threshold of 6 on the 8-bit RGB channels, 32.92% of pixels differed between
+the forward eyes. The yaw and lean changed 88.22% and 40.16% of the left
+eye's pixels, respectively. The turned view showed the edge of the modeled
+dock.
+
+The same build opened two 1728×1728 sRGB swapchains in SteamVR and
+submitted its first projection frame. SteamVR accepted the suggested
+Frame controller bindings. That startup session stayed in
+`XR_SESSION_STATE_SYNCHRONIZED`; the guest clock remained paused.

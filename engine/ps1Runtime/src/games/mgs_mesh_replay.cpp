@@ -101,6 +101,7 @@ struct RecoverySource {
 };
 std::array<RecoverySource, 2> recoverySources;
 std::array<uint64_t, 2> recoveredCaptures{};
+bool stereoCapture = false;
 using Weights = std::array<float, 4>;
 struct SubdividedFace {
   uint32_t parent;
@@ -334,8 +335,9 @@ void prepareFullSourceMeshes(const SceneSnapshot &scene, const Memory &memory,
         face.draw.originalMesh->lighting = lighting;
         face.draw.originalMesh->sourceTopology =
             face.draw.originalMesh->sourceRecovery = true;
-        face.visible = sourceFaceVisible(source->second.view, scene,
-                                         instance.models[model].flags & 0x400u);
+        const bool bothSides = instance.models[model].flags & 0x400u;
+        face.draw.originalMesh->stereoCullBack = stereoCapture && !bothSides;
+        face.visible = sourceFaceVisible(source->second.view, scene, bothSides);
         visibleFaces += face.visible;
         const auto &eye = source->second.view;
         const double depth = (std::clamp(eye[0][2], 0.0, 65535.0) +
@@ -999,7 +1001,7 @@ void resetMeshReplay() {
 void setMeshReplayCache(const AssetCache *value) {
   cache = value;
   const char *mode = std::getenv("PS1_MGS_MESH_REPLAY");
-  enabled = cache && mode && std::string_view(mode) == "1";
+  enabled = cache && (stereoCapture || (mode && std::string_view(mode) == "1"));
   const char *recovery = std::getenv("PS1_MGS_SCENE_RECOVERY");
   recoveryEnabled = enabled && (!recovery || std::string_view(recovery) != "0");
   const char *topology = std::getenv("PS1_MGS_SOURCE_MESHES");
@@ -1008,6 +1010,7 @@ void setMeshReplayCache(const AssetCache *value) {
   indexSourceVertices();
   indexTextures();
 }
+void setMeshReplayStereo(bool enabled) { stereoCapture = enabled; }
 void beginMeshDivide(recomp_context *ctx) {
   if (!enabled || !active() || !ctx || !ctx->mem)
     return;
@@ -1333,14 +1336,14 @@ recoverSceneReplay(uint32_t listStart, std::span<const uint8_t> ram) {
           metrics::count("mgs.source.unknown_packet_faces");
           continue;
         }
-        if (freshCapture && face.visible) {
+        if (freshCapture && (face.visible || stereoCapture)) {
           result->buckets[face.bucket].push_back(face.draw);
           ++recovered;
         }
         continue;
       }
       const uint32_t index = result->meshes.size();
-      result->meshes.push_back({face.draw, face.visible});
+      result->meshes.push_back({face.draw, face.visible || stereoCapture});
       for (uint32_t node : native->second)
         result->meshNodes.emplace(node, index);
     }

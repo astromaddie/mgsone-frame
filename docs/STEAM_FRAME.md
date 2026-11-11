@@ -1,10 +1,11 @@
 # Steam Frame
 
-The first milestone is the original game running flat as a native ARM64 Linux
-program on Steam Frame. The upstream x86-64 AppImage and Flatpak are separate
-builds. See [VR architecture](VR_ARCHITECTURE.md) for the stereo work.
+The Steam Frame build runs natively on ARM64 Linux and supports a flat
+launcher and an OpenXR entry point. The upstream x86-64 AppImage and Flatpak
+are separate builds. See [VR architecture](VR_ARCHITECTURE.md) for the eye
+renderer and the dock capture.
 
-## Build the flat baseline
+## Build on ARM64
 
 Use a dedicated writable checkout and two original **USA v1.0** disc images
 (`SLUS-00594` and `SLUS-00776`). The build checks the image hashes before
@@ -15,7 +16,7 @@ executable patches and overlay addresses are specific to v1.0.
 On a Steam Frame with the build tools already installed, use a terminal in
 Desktop Mode. The build defaults to Clang and needs CMake, Ninja, Python 3.11 or newer,
 SDL2 2.26 or newer (including sdl2-compat), Vulkan headers and loader, and
-`glslc`. No system changes are needed on a Frame that already has these tools.
+`glslc`. CMake fetches the pinned Khronos OpenXR SDK for the VR build.
 
 For a separate ARM64 Ubuntu 24.04 environment, install the same tools there:
 
@@ -55,6 +56,12 @@ and reloads.
 Check the simulation pace and Vulkan output at the dock before raising the
 resolution. A source-only build with `PS1RECOMP_USE_STUB=ON` checks the compiler
 and runtime dependencies; it cannot start the retail game.
+
+For VR, add a separate shortcut to the same script with `--vr` in its launch
+options. It opens the game directly in SteamVR and shares the flat build's
+disc import, settings and saves. The Frame D-pad and left stick move Snake.
+The face buttons, triggers, bumpers, Menu and View map to the original
+controller using the flat build's gamepad layout.
 
 ## Evidence
 

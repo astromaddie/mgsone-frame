@@ -30,6 +30,8 @@ struct RendererOptions {
   uint32_t presentationHeight = 0;
   // Godot/ASSAO adapter, presentation only; enabled by the MGS host profile.
   bool ambientOcclusion = false;
+  bool mgsVr = false;
+  std::string mgsVrCaptureDirectory;
 };
 
 inline constexpr std::optional<DisplayAreaPolicy>

@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(MGS_STEAM_FRAME "Build a native ARM64 Linux baseline for Steam Frame" OFF)
+option(MGS_STEAM_FRAME_VR "Enable MGS OpenXR and stereo captures" ${MGS_STEAM_FRAME})
 if(MGS_STEAM_FRAME)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
        NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
@@ -45,6 +46,9 @@ add_subdirectory(third_party/toml11)
 add_subdirectory(third_party/fmt)
 
 # Project components
+if(MGS_STEAM_FRAME_VR)
+    include(cmake/MgsOpenXR.cmake)
+endif()
 add_subdirectory(ps1Analyzer)
 add_subdirectory(ps1Recomp)
 add_subdirectory(ps1Runtime)

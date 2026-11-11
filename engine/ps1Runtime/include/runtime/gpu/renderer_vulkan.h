@@ -472,7 +472,9 @@ public:
 
   bool init(const std::string &windowTitle, int width = 800, int height = 600,
             bool vsync = true, bool fullscreen = false);
+  bool beginVrFrame(uint16_t &buttons);
   void renderFrame();
+  bool healthy() const { return healthy_; }
   // Host-only UI, composed after the scene on the swapchain. It never enters
   // VRAM, game feedback, screenshots used by game logic or temporal effects.
   void setHostOverlay(std::function<void()> draw);

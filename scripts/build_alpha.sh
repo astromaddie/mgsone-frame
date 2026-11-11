@@ -40,7 +40,8 @@ print(installed(user_paths(override=sys.argv[1]))[0])
 PY
 )"
 cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DMGS_STEAM_FRAME="$frame" -DPS1RECOMP_USE_STUB=ON -DPS1RECOMP_DIAGNOSTIC_FAST_COMPILE=ON
+  -DMGS_STEAM_FRAME="$frame" -DMGS_STEAM_FRAME_VR="$frame" \
+  -DPS1RECOMP_USE_STUB=ON -DPS1RECOMP_DIAGNOSTIC_FAST_COMPILE=ON
 cmake --build build --target ps1Analyzer ps1Recomp --parallel "${BUILD_JOBS:-$default_jobs}"
 python3 scripts/prepare_native.py --campaign --exe "$alpha_media_root/SLUS_005.94" \
   --cue "$alpha_media_root/disc1.cue" --disc2-cue "$alpha_media_root/disc2.cue"
@@ -52,7 +53,7 @@ build/ps1Test/mgsController_tests --gtest_brief=1
 build/ps1Test/ps1Runtime_tests --gtest_brief=1
 python3 -m unittest discover -s scripts/tests
 if [[ $frame == ON ]]; then
-  echo "Steam Frame baseline build and unit tests complete. See docs/STEAM_FRAME.md for the first launch."
+  echo "Steam Frame build and unit tests complete. See docs/STEAM_FRAME.md for the launch commands."
 else
   echo "Native build and unit tests complete. Package with scripts/package_alpha.py OUTPUT_DIRECTORY."
 fi

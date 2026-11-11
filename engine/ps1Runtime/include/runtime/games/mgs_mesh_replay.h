@@ -43,6 +43,7 @@ bool bindRecoveredSceneDraw(gpu::replay::DrawPacket &packet,
 // Producer-thread bridge. It changes the presentation packet only, never RAM,
 // the GP0 command stream or the authoritative software raster.
 void setMeshReplayCache(const AssetCache *cache);
+void setMeshReplayStereo(bool enabled);
 void resetMeshReplay();
 void prepareMeshReplay(recomp_context *ctx);
 void beginMeshDivide(recomp_context *ctx);
