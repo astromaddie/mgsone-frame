@@ -233,6 +233,7 @@ private:
   uint32_t cdDaReadPos_ = 0;
   uint64_t generatedSampleCount_ = 0;
   bool firstNonzeroOutputSeen_ = false;
+  bool playbackPrimed_ = false; // Host queue state, never part of a savestate.
 
   // Thread safety
   mutable std::mutex mutex_;

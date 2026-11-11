@@ -530,6 +530,45 @@ TEST_F(SpuAdpcmTest, GuestClockRestoreRetainsUnconsumedSampleCredit) {
   EXPECT_EQ(spu.snapshot().clockSamplesPending, 0u);
 }
 
+TEST_F(SpuAdpcmTest, GuestPlaybackPrimesWithoutConsumingOrAdvancingAudio) {
+  spu.enableGuestClock();
+  spu.writeRegister(0x1F801D80, 0x7fff);
+  spu.writeRegister(0x1F801D82, 0x7fff);
+  spu.writeRegister(0x1F801DB0, 0x7fff);
+  spu.writeRegister(0x1F801DB2, 0x7fff);
+  spu.writeRegister(0x1F801DAA, 1);
+  const std::vector<int16_t> input(16384, 10000);
+  spu.pushXaSamples(input.data(), input.size());
+  std::array<int16_t, 2048> output;
+  spu.accrueSamples(735);
+  spu.serviceClock();
+  spu.generateSamples(output.data(), 1024);
+  EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto s) { return s == 0; }));
+  EXPECT_EQ(spu.snapshot().generatedSampleCount, 735u);
+  spu.accrueSamples(1470);
+  spu.serviceClock();
+  spu.serviceClock();
+  spu.generateSamples(output.data(), 1024);
+  EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto s) { return s == 0; }));
+  EXPECT_EQ(spu.snapshot().generatedSampleCount, 2205u);
+  spu.accrueSamples(1470);
+  spu.serviceClock();
+  spu.serviceClock();
+  spu.generateSamples(output.data(), 1024);
+  // Two signed Q15 gains of 0x7fff turn 10000 into 9998.
+  EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto s) { return s == 9998; }));
+  EXPECT_EQ(spu.snapshot().generatedSampleCount, 3675u);
+  spu.generateSamples(output.data(), 1024);
+  EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto s) { return s == 9998; }));
+  const auto checkpoint = spu.snapshot();
+  spu.restore(checkpoint);
+  spu.accrueSamples(735);
+  spu.serviceClock();
+  spu.generateSamples(output.data(), 1024);
+  EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto s) { return s == 0; }));
+  EXPECT_EQ(spu.snapshot().generatedSampleCount, 4410u);
+}
+
 TEST_F(XaAdpcmTest, CdGainPolarityAndDisableConsumeRatherThanDelayAudio) {
   spu.writeRegister(0x1F801D80, 0x7fff);
   spu.writeRegister(0x1F801D82, 0x7fff);

@@ -9,14 +9,17 @@
 #include "runtime/gpu/gpu.h"
 #include "runtime/gpu/mgs_asset_cache_vulkan.h"
 #include "runtime/input/input.h"
+#include "runtime/metrics.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <numbers>
 #include <span>
+#include <thread>
 #include <vector>
 
 #ifndef PS1RECOMP_VULKAN_SHADER_DIR
@@ -26,7 +29,6 @@
 namespace ps1::gpu::vr {
 namespace {
 constexpr uint32_t maxFaces = 32768;
-constexpr uint32_t captureSize = 768;
 constexpr uint32_t vramWords = GPU::VRAM_WIDTH * GPU::VRAM_HEIGHT;
 constexpr float gameUnitsPerMetre = 1000;
 
@@ -413,6 +415,8 @@ struct Renderer::Impl {
   uint64_t revision = UINT64_MAX, builtFrame = UINT64_MAX;
   uint64_t lastWorld = 0, captureAt = 0, submitted = 0;
   uint32_t solidVertices = 0, worldVertices = 0, worldFaces = 0;
+  uint32_t captureSize = 768, headlessHz = 0;
+  std::chrono::steady_clock::time_point headlessNext{};
   bool canDraw = false, captured = false, cacheBound = false;
   bool firstPerson = false, switchHeld = false;
   uint64_t playerEpoch = 0, playerLifetime = 0;
@@ -674,6 +678,13 @@ struct Renderer::Impl {
     if (offscreen()) {
       std::filesystem::create_directories(directory);
       xr.openOffscreen();
+      if (const char *value = std::getenv("PS1_VR_HEADLESS_RENDER_HZ")) {
+        headlessHz = std::stoul(value);
+        if (headlessHz != 72 && headlessHz != 90 && headlessHz != 120)
+          throw std::runtime_error("Offscreen stereo rate must be 72, 90 or 120 Hz");
+        captureSize = 1728;
+        ps1::metrics::setState("vr.headless_eye_size", captureSize);
+      }
       if (const char *value = std::getenv("PS1_VR_CAPTURE_VBLANK"))
         captureAt = std::stoull(value);
       if (const char *value = std::getenv("PS1_VR_FIRST_PERSON"))
@@ -883,7 +894,7 @@ struct Renderer::Impl {
       std::memcpy(materialBuffer.mapped, materials.data(), materials.size() * sizeof(Material));
   }
 
-  void drawEyes(const std::array<EyeView, 2> &views) {
+  void drawEyes(const std::array<EyeView, 2> &views, bool readPixels = true) {
     const bool showAim = playerCamera && pad.aimValid;
     std::array<Vertex, 12> reticle{};
     if (showAim) {
@@ -965,7 +976,7 @@ struct Renderer::Impl {
         draw(panelPipeline, vertices.size(), vertices.size() + reticle.size());
       }
       vkCmdEndRenderPass(xr.commands);
-      if (offscreen()) {
+      if (offscreen() && readPixels) {
         VkBufferImageCopy copy{};
         copy.bufferOffset = i * captureSize * captureSize * 4u;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -974,7 +985,7 @@ struct Renderer::Impl {
                                readback.buffer, 1, &copy);
       }
     }
-    if (offscreen()) {
+    if (offscreen() && readPixels) {
       VkBufferMemoryBarrier hostRead{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
       hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
       hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -1018,6 +1029,12 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
   auto &state = *impl_;
   sample = {};
   if (state.offscreen()) {
+    if (state.headlessHz) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto period = std::chrono::nanoseconds(1000000000 / state.headlessHz);
+      state.headlessNext = std::max(state.headlessNext + period, now);
+      std::this_thread::sleep_until(state.headlessNext);
+    }
     if (state.playerCamera && state.worldFrame) {
       const auto &player = *state.worldFrame->latch().mgsPlayerView;
       if (const char *heading = std::getenv("PS1_VR_HEADLESS_MOVE_YAW");
@@ -1130,6 +1147,12 @@ void Renderer::present() {
   if (!state.offscreen() && !state.canDraw) return;
   state.updateScene();
   if (state.offscreen()) {
+    if (state.headlessHz) {
+      state.drawEyes(state.eyes, false);
+      ps1::metrics::count("vr.headless_stereo_pair");
+      ps1::metrics::setState("vr.headless_world_faces", state.worldFaces);
+      return;
+    }
     if (state.captured || state.worldFaces == 0 || state.builtFrame < state.captureAt ||
         (state.firstPerson && !state.playerCamera))
       return;

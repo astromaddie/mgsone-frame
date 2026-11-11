@@ -70,6 +70,7 @@ void SPU::reset() {
   firstNonzeroOutputSeen_ = false;
   clockSamplesPending_ = 0;
   playbackQueue_.clear();
+  playbackPrimed_ = false;
 }
 
 SPU::Snapshot SPU::snapshot() const {
@@ -137,6 +138,7 @@ void SPU::restore(const Snapshot &state) {
   generatedSampleCount_ = state.generatedSampleCount;
   clockSamplesPending_ = state.clockSamplesPending;
   playbackQueue_.clear();
+  playbackPrimed_ = false;
   firstNonzeroOutputSeen_ = state.firstNonzeroOutputSeen;
 }
 
@@ -883,18 +885,36 @@ void SPU::processVoice(uint32_t voiceIdx, int32_t &outL, int32_t &outR,
 
 void SPU::generateSamples(int16_t *outputBuffer, uint32_t numSamples) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (numSamples == 0) return;
   ps1::metrics::count("spu.audio_callback");
   if (!guestClock_) {
     const auto generated = generateSamplesLocked(outputBuffer, numSamples, false);
     captureSamples(outputBuffer, generated);
     return;
   }
+  ps1::metrics::count("spu.playback_requested_sample", numSamples);
+  // Guest PCM arrives in VBlank/IRQ bursts; SDL requests independent blocks.
+  // Starting with the first partial block leaves no reserve for their phase
+  // difference and inserts silence into otherwise continuous music. Keep three
+  // callback blocks ready before the first read (and after a real underrun).
+  const size_t primeFrames = std::min<size_t>(size_t(numSamples) * 3, SAMPLE_RATE / 4);
+  if (!playbackPrimed_ && playbackQueue_.size() / 2 < primeFrames) {
+    std::fill_n(outputBuffer, size_t(numSamples) * 2, 0);
+    ps1::metrics::count("spu.playback_priming_sample", numSamples);
+    return;
+  }
+  playbackPrimed_ = true;
   const auto available = std::min<size_t>(numSamples * 2, playbackQueue_.size());
   for (size_t i = 0; i < available; ++i) {
     outputBuffer[i] = playbackQueue_.front();
     playbackQueue_.pop_front();
   }
   std::fill(outputBuffer + available, outputBuffer + numSamples * 2, 0);
+  if (available < size_t(numSamples) * 2) {
+    ps1::metrics::count("spu.playback_underrun_sample", numSamples - available / 2);
+    playbackPrimed_ = false;
+  }
+  ps1::metrics::setState("spu.playback_queued_sample", playbackQueue_.size() / 2);
 }
 
 void SPU::accrueSamples(uint32_t count) {
