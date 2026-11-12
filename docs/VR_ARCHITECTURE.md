@@ -7,8 +7,9 @@ with PS1 ordering-table packets. A second view of the current 16:9 output
 would lose the geometry that was clipped or culled for that view.
 
 The default third-person view is a room-anchored miniature stage. Its origin
-is captured once per scene epoch and it sits 2.4 m in front of the opening
-head pose, 0.9 m below it. Scale is 8% of the 1,000-units-per-metre world.
+is captured once per scene epoch and it sits 1.7 m in front of the opening
+head pose, 0.65 m below it. Scale is 12% of the 1,000-units-per-metre world,
+with a fixed 45-degree tabletop tilt.
 Every source face is transformed back through its retained channel matrix
 before placement. Guest camera pans, cuts and Snake movement cannot change
 the room placement. R3 switches to first person and back. Holding View for
@@ -60,52 +61,19 @@ geometry once for both eyes and draws it through two depth-tested,
 asymmetric projections. The tracked eye poses retain the runtime's physical
 IPD. A scene epoch change places a new toybox; moving the player does not.
 
-In first person the eye follows an offset within the native head model's
-rendered pose. Torso,
-legs, arms and hands remain visible. Only head-model faces within 180 game
-units of the eye are suppressed. I capture the shoulder, elbow and wrist
-matrices from the authenticated 16-model Snake hierarchy alongside the camera.
-Both controller grip poses are located at the eyes' predicted display time.
-A two-bone solve keeps the native segment lengths and clamps unreachable
-wrists just inside full extension. A transported elbow pole keeps wrist roll
-from flipping the arm. Original KMD seam corners keep their own rigid owner,
-and authenticated attached pieces inherit the same wrist delta.
+In first person the eye follows local (0,50,60)mm within head model 6's
+rendered pose. Torso, legs, arms and hands use the native animation. Only
+head-model faces within 180 game units of the eye are suppressed. I disabled
+controller arm IK and hand-driven weapon poses. The old solve and guest
+handoff remain covered by tests, but the renderer never activates or publishes
+them, including with synthetic hand diagnostics. There’s no controller aim ray.
 
-I update only the affected vertices once per display frame, before either eye.
-The guest matrices, native packet oracle and third-person toybox stay on the
-original animation. Tracking acquisition and loss blend rigid segment rotations
-over 120 ms, rebuilding the elbow and wrist from the native segment lengths.
-That returns both the elbow plane and mesh orientation to the exact native
-pose, including a straight arm. Losing focus, changing context or recentering
-resets the solve. Focus loss clears the atomic weapon handoff before the
-standby early return, even when no presentation frame follows. Wall presses, damage,
-ladders and other authored handlers retain their native arms.
-
-The renderer publishes the solved wrist through an atomic host snapshot. At
-an authenticated NewBullet call, I recover that weapon's local shot transform
-from the current native wrist, then apply it to the solved wrist. That keeps
-the rendered gun and shot on the same rigid transform without guessed muzzle
-offsets. The original constructor still owns ammunition, hit tests and damage.
-
-Before moving a shot, I query the native segment from its original start to
-the proposed start. A verified vertical wall constrains only the wall-normal
-component, keeping the hand's tangent coordinates. Its near-side inset ramps
-from one native coordinate unit to 20 as penetration increases. Floors and
-unverified wall records keep the segment clamp with its 20-unit inset. I
-recheck the segment after applying arm reach limits.
-An invalid query or failed recheck retains both the native gun and native shot.
-The guest control hook refreshes the constraint after a weapon's local muzzle
-offset has been authenticated, so moving clear does not require another shot.
-Weapon changes discard the cached offset. The first shot always checks its
-actual retail matrix again.
-
-The USA SOCOM laser helper at `0x80067728` identifies
-`HZD_OnlineHazardCheck` at `0x80029974` by its complete call sequence and retail
-instructions. I check its entry words before dispatch. The extra query uses
-all four hazard classes and skips no segment attributes. It runs on a copied
-CPU/GTE context with callbacks blocked, and restores a 2 KB temporary stack,
-the full 1 KB scratchpad, and the hazard iterator cursor at `GP + 0x81c`,
-including precision metadata. No renderer or VBlank path writes actor RAM.
+The diorama uses a fixed 45-degree tabletop tilt. A 1.8m character becomes a
+21.6cm figure. I take the initial heading from native pad Up (`PadOrg + 2048`),
+then keep it fixed through camera cuts and movement. Stick and D-pad directions
+are compensated against the current native pad frame, so up moves away across
+the displayed table. This changes only pad input; native animation and collision
+still own Snake's movement. A new scene or explicit recenter places the stage.
 
 Forward/back/strafe follow the headset's horizontal heading. Right-stick
 turning adds up to 90°/s. The rotated analog input still enters the original
@@ -124,14 +92,18 @@ instructions. USA addresses differ from the symbolic addresses in the
 The actual boundaries are 0x8005CAB4 (animation callbacks) and 0x80026FA4
 (GM_ActControl), restricted to the Snake call returning to 0x8005D0FC.
 
-The right controller's OpenXR aim pose still supplies pointing and the native
-weapon stance. With arm tracking active, the rendered grip-driven gun supplies
-the shot transform through the fingerprinted NewBullet boundary described
-above. Without tracked arms, the previous direction-only hook preserves the
-native muzzle and the original firing, ammunition and collision code.
-The three resident player call sites cover SOCOM, FAMAS and rifle bullets.
-The right trigger uses the game's Square action, and the right grip uses
-R2 for the weapon menu. A short controller ray and level projected marker show the tracked aim.
+Head and right-stick yaw turn Snake, including the authenticated SOCOM/FAMAS
+firing action. HMD pitch is view-only: it never changes body-root pitch. I keep
+the native weapon animation, gun aiming and autotarget behavior. Shots use the
+original NewBullet matrix, muzzle, ammunition and hit logic; they don't follow
+the headset's vertical gaze vector. The firing hook changes only yaw and target
+yaw, keeping native pitch, roll, position, step and action transitions.
+The right trigger uses Square; the right grip uses R2 for the weapon menu.
+Controller poses don't move the gun or its shot origin.
+
+The offscreen `PS1_VR_HEADLESS_AIM_YAW` diagnostic changes facing only.
+`PS1_VR_HEADLESS_AIM_PITCH` is ignored. The down60/down85 captures rotate the
+view independently, so they can inspect the body without tilting it.
 
 Title, Codec and video use the latched native scanout on a yaw-only 2 m,
 1.9 m-wide panel. World admission requires the producer's authenticated
@@ -142,13 +114,23 @@ the title as gameplay, replayed incomplete UI and made the menu follow the
 head. Such mesh-bearing frames now immediately use the complete native
 scanout, including its original portrait shading and menu text. Codec still
 forces cinema, and empty interleaved latches keep the short world reuse window.
-The player witness rejects paused/scripted/authored views, so those keep their
-native presentation. `capture.txt` records `source_faces` and `player_witness`
+Native Start pause and item/weapon selectors keep the authenticated world
+behind their UI. Their directional input stays native while the menu is open.
+For authenticated ordinary Snake idle/run/crouch/prone and SOCOM/FAMAS firing,
+I also keep the world through native behind-camera, cut-in and menu-off hints.
+Those hints alone don't establish a cutscene. This is a render policy: the
+same states still keep their original native input and movement guards.
+Unknown handlers don't get that exception. DEMO, PADDEMO, pad masking,
+game-over, authored player states, STOP and disc errors keep native presentation.
+Codec always forces cinema. `capture.txt` records `source_faces` and `player_witness`
 beside admitted `world_faces`. The Frame title capture at VBlank 3200 shows
 the original dark portrait and both menu choices; the difficulty capture at
 4400 shows all four choices. Both use native scanout with `world_faces=0`.
 Gameplay HUD uses retained ordered UI draws, including
-polygon UI without XYZ provenance. Its draw-page origin is independent of
+polygon UI without XYZ provenance and recorded TILE1 paint. Snake's radar dot
+is the native white point at the radar draw origin, with its original blink
+phase. Paint-only latches refresh the HUD too. Full-page opaque paint still
+uses background rejection. Its draw-page origin is independent of
 the current display page, and partially clipped primitives keep their visible
 portion. Gameplay HUD follows the live head midpoint, yaw and pitch without
 roll. Title/Codec/video panels keep their separate room anchor. Regaining
@@ -176,6 +158,46 @@ at X=0/320 and radar clips at X=235/555 with offsets 269/589.
 `capture.txt` records each draw area, offset, selected page and packet count.
 Screen effects that depend on the flat renderer's
 feedback or temporal history still need eye-local implementations.
+
+## Camera and HUD Checks
+
+I checked these changes on 2026-11-12 using an isolated copy of the native
+Slot 1 save: `s01a`, story 18. The original memory cards stayed unchanged.
+The lower first-person camera retained 3,102 world faces and 260 body faces.
+Forward, down60 and down85 eye captures kept the native body visible without
+blocking the forward view. The diorama retained 3,183 world faces and showed
+the heliport from the corrected native Up direction.
+
+The radar recorder retained the native `C8C8C8` TILE1 at `(589,42)` on page
+320. Its projected white point was missing from the old eye image and present
+in the new one. The GPU regression also checks page 0 and the native blink.
+Holding L2 in the same gameplay process reproduced the selector bug: the old
+build switched to cinema, while the new build kept 3,102 world faces behind
+the item icons with native pause level 4.
+
+For the alert check, I used
+`scripts/fixtures/frame-vr/heliport-alert.mgsr` from the loaded checkpoint.
+It walks around the entry crate through normal pad input and stops at the
+first native alert. It doesn't change RAM. The route reached alert mode 3
+after 909 VBlanks. I replayed its recorded pad intervals from
+`scripts/fixtures/frame-vr/heliport-alert.input` for the eye checks. Captures
+60 and 120 VBlanks after that alert retained
+3,183 world faces. This guard route stayed in 3D in both builds; it didn't
+reproduce the reported camera-cut variant. The separate view-policy check
+covers ordinary camera/menu hints and keeps native input guards unchanged.
+The final build passed all 24 focused view/movement checks on the Frame,
+including whole-RAM invariance for both input hooks through those hint states.
+
+Run the route with `scripts/mgs_tas.py record --native-route` using an isolated
+profile, copied cards and `mgs_campaign.terminal_checkpoint()` from the load
+session. `states/quick_slot_0.ps1s` in that session is its initial boot state.
+For repeatable eye checks, use `--vr-headless`, `PS1_MGS_MESH_REPLAY=1`, the
+imported asset cache, bundled shader directory and process-local dummy audio.
+Use a 16,667 us VBlank period and keep native display dumps around the chosen
+capture VBlank. I used a 235-VBlank warmup after the loaded checkpoint, then
+held L2 from offsets 185 to 335 and captured the selector at offset 275.
+Inspect the reported `panel_latch`, `world_latch` and `player_witness`; loading
+clears source snapshots, so an early panel-only capture isn't a gameplay check.
 
 The VBlank 16060 first-person capture showed a black HUD-sized plate over
 Snake's body. I found that `GPU::executeRectangle` retains MGS TILE commands
@@ -215,7 +237,7 @@ down60 strip's right edge at pixels (448.39,331.56) and (414.92,635.97).
 The torso reached 23.7mm above the joint and the neck reached 45.5mm above
 it. The camera was sitting inside the collar region.
 
-I moved the eye origin to local (0,100,60)mm on head model 6: 100mm above
+The earlier collar correction moved the eye origin to local (0,100,60)mm on head model 6: 100mm above
 the joint and 60mm toward the face. The native head's local bounds are
 Y=-60..165mm and Z=-90..93mm, so this sits within the head instead of the
 collar. The offset follows the same presentation matrix used by the body
@@ -231,12 +253,13 @@ VBlank 16115 reached Snake's wall callback `0x80055040`, player status
 [`status definitions`](https://github.com/FoxdieTeam/mgs_reversing/blob/1b25ad9babdbefa2a519d20d0f9c3027e19ae517/source/game/g_define.h#L29-L61)
 name these `PLAYER_CAUTION` and `STATE_BEHIND_CAMERA`.
 [`GM_CheckBehindCamera`](https://github.com/FoxdieTeam/mgs_reversing/blob/1b25ad9babdbefa2a519d20d0f9c3027e19ae517/source/game/camera.c#L1154-L1183)
-sets that camera bit during wall interaction. I allow that bit only with
+sets that camera bit during wall interaction. For wall actions, I allow it with
 authenticated Snake wall status and the USA wall idle/move/crouch callbacks
 `0x80055040`, `0x80055134`, `0x800552B8`. I matched those retail callbacks
 against the pinned
 [`wall helpers`](https://github.com/FoxdieTeam/mgs_reversing/blob/1b25ad9babdbefa2a519d20d0f9c3027e19ae517/source/chara/snake/sna_init.c#L3289-L3420).
-All other authored-view bits and pause checks still apply. Wall actions keep
+The ordinary-action camera-hint policy doesn't broaden wall admission.
+Other authored-view bits and pause checks still apply there. Wall actions keep
 their native control logic; admission doesn't enable the movement override
 for them. The matching native Up capture at VBlank 16115 contains 2,926 world
 faces and a live player witness. Its stage epoch and centre match the
@@ -249,7 +272,7 @@ The affected control map is:
 
 | Physical Control | Third Person | First Person |
 | --- | --- | --- |
-| Left Stick / D-Pad | Native Movement / Navigation | Head-Relative Move / Native Navigation |
+| Left Stick / D-Pad | Table-Relative Move / Native Navigation | Head-Relative Move / Native Navigation |
 | Right Stick X | Native | Turn Heading |
 | R3 | First Person | Toybox |
 | A / B / X / Y | Cross / Circle / Square / Triangle | Same |
@@ -504,7 +527,10 @@ of RGB channels by more than 6/255, and crossed poses changed 48.8%. Comparing
 the two left-eye poses changed 6.2% of channels above that threshold. These
 are offscreen production captures, separate from physical controller input.
 
-## Firearm Firing Action
+## Earlier Tracked Firearm Checks
+
+These measurements describe the tracked-arm implementation before I disabled
+it. Current production rendering and firing use native arms and muzzle position.
 
 The VBlank 16082 trace exposed a gap in the original movement-only arm gate:
 Snake's callback was `0x800599AC` with `PLAYER_ATTACK` (`0x800`), so capture cleared the

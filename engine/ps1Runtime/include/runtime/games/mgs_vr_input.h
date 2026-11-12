@@ -9,7 +9,7 @@ namespace ps1::games::mgs {
 // remains separate: a native firing action must not become VR locomotion.
 bool isVrFirearmAction(const Memory &memory, uint32_t handler,
                        int16_t weapon) noexcept;
-// Publish the tracked controller's world direction. A zero vector clears it.
+// Legacy direct shot diagnostic. Production keeps this zero for native aiming.
 void setVrShotDirection(const std::array<float, 3> &direction) noexcept;
 // The renderer publishes only a desired wrist transform. The guest NewBullet
 // boundary validates ownership and the native hazard segment before using it.
@@ -24,7 +24,8 @@ struct VrWeaponConstraint {
   bool nativeFallback = false;
 };
 VrWeaponConstraint vrWeaponConstraint() noexcept;
-// Atomically publish a sample. Only guest-thread bridges may touch actor RAM.
+// Atomically publish yaw/movement only; aimPitch is intentionally ignored.
+// Only guest-thread bridges may touch actor RAM.
 void setVrMovement(const input::VrInputSample &sample) noexcept;
 }
 void mgsApplyVrBulletAim(recomp_context *ctx);

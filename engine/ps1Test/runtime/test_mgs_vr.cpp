@@ -3,7 +3,11 @@
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_scene.h"
 #include "runtime/memory.h"
+#include "runtime/gpu/gpu.h"
+#include "runtime/gpu/modern_replay_recorder.h"
+#include "runtime/games/mgs_profile.h"
 #include "runtime/input/host_input.h"
+#include "runtime/input/tas_route.h"
 #include "../../ps1Runtime/src/vr/scene_view.h"
 #include <gtest/gtest.h>
 #include <cstring>
@@ -37,6 +41,129 @@ TEST(MgsVrView, ToyboxPlacementIgnoresMovementUntilSceneChanges) {
   EXPECT_EQ(before, stage.transform({2000,1000,3000}));
   stage.place(8, {30000,500,10000});
   EXPECT_NE(before, stage.transform({2000,1000,3000}));
+}
+
+TEST(MgsVrView, DioramaInitialUpMatchesNativePadAndRouteConvention) {
+  // Pinned libgv/pad.c GetPadDir maps Up to2048 before adding PadOrg.
+  // These explicit world vectors also pass through production native MOVE.
+  const std::array<Vec3,4> nativeUp{{{0,0,-1000},{-1000,0,0},{0,0,1000},{1000,0,0}}};
+  for(unsigned quarter=0;quarter<4;++quarter) {
+    const uint16_t padOrigin=quarter*1024;
+    Toybox stage;stage.place(7,{},Toybox::nativeUpHeading(padOrigin));
+    const auto origin=stage.transform({}),destination=stage.transform(nativeUp[quarter]);
+    EXPECT_NEAR(destination[0],origin[0],1e-6f);
+    EXPECT_GT(destination[1],origin[1]);EXPECT_LT(destination[2],origin[2]);
+    const auto stick=input::headRelativeStick(0,1,stage.heading,padOrigin);
+    EXPECT_EQ(stick,(std::array<uint8_t,2>{128,1})); // original analog Up
+    Memory memory;memory.write32(0x800AE16C,0x80100000);memory.write32(0x800ADAA8,padOrigin);
+    input::TasRoute route;std::string error;
+    const std::string script="MGSROUTE 1\nSTEP native_up 100 1\nUNTIL story eq 1 4294967295\nMOVE "+
+        std::to_string(int(nativeUp[quarter][0]))+" "+std::to_string(int(nativeUp[quarter][2]))+"\nEND\n";
+    ASSERT_TRUE(route.parse(script,error))<<error;
+    EXPECT_EQ(route.sample(memory.ramPtr(),Memory::RAM_SIZE,1)[0],input::BTN_UP);
+  }
+}
+
+TEST(MgsVrView, DioramaUsesOneFixedViewBasisForStageAndNativePad) {
+  constexpr float pi=3.14159265358979323846f;
+  for(float heading:{0.0f,pi/2,pi,-pi/2}) {
+    Toybox stage;stage.place(7,{1200,400,-600},heading);
+    const auto origin=stage.transform(stage.centre);
+    const auto up=stage.transform({1200,2200,-600});
+    EXPECT_GT(up[1],origin[1]); // Snake stands visibly above the tilted table
+    EXPECT_GT(up[2],origin[2]);
+    EXPECT_NEAR(std::hypot(up[1]-origin[1],up[2]-origin[2]),0.216f,1e-5f);
+    for(const auto stick:std::array<std::array<float,2>,4>{{{0,1},{1,0},{0,-1},{-1,0}}}) {
+      const float angle=heading-std::atan2(stick[0],stick[1]);
+      const Vec3 destination{1200+1000*std::sin(angle),400,-600+1000*std::cos(angle)};
+      const auto shown=stage.transform(destination);
+      EXPECT_NEAR(shown[0]-origin[0],stick[0]*Toybox::scale*1000,1e-5f);
+      EXPECT_NEAR(shown[1]-origin[1],stick[1]*Toybox::scale*1000*std::sqrt(0.5f),1e-5f);
+      for(uint16_t padOrigin:{0,1024,2048,3072}) {
+        const auto pad=input::headRelativeStick(stick[0],stick[1],stage.heading,padOrigin);
+        const float nativeAngle=std::atan2(float(pad[0])-128,float(pad[1])-128)+padOrigin*(2*pi/4096);
+        EXPECT_NEAR(std::sin(nativeAngle),std::sin(angle),0.01f);
+        EXPECT_NEAR(std::cos(nativeAngle),std::cos(angle),0.01f);
+        // Same production merge as main_host: raw digital directions must not
+        // override the compensated analog route, while actions stay native.
+        input::HostInput host;input::InputController controller;
+        input::VrInputSample vr;vr.analogMovement=true;vr.x=pad[0];vr.y=pad[1];
+        vr.buttons=input::BTN_SQUARE | (stick[0]>0?input::BTN_RIGHT:stick[0]<0?input::BTN_LEFT:
+            stick[1]>0?input::BTN_UP:input::BTN_DOWN);
+        host.gamepad=vr.buttons;host.apply(controller,false,&vr);controller.latchVBlank();
+        const auto routed=controller.latchedSample()[0];
+        EXPECT_EQ(routed.padType,input::PadType::Analog);
+        EXPECT_EQ(routed.analogLX,pad[0]);EXPECT_EQ(routed.analogLY,pad[1]);
+        EXPECT_EQ(routed.buttons&0xf0,0xf0); // active-low, no unrotated D-pad
+        EXPECT_EQ(routed.buttons&input::BTN_SQUARE,0);
+        EXPECT_FALSE(vr.facing);EXPECT_FALSE(vr.movementHeading);
+        vr.analogMovement=false;host.apply(controller,false,&vr);controller.latchVBlank();
+        EXPECT_EQ(controller.latchedSample()[0].padType,input::PadType::Digital);
+        EXPECT_EQ(controller.latchedSample()[0].buttons&vr.buttons,0); // menus stay native
+      }
+    }
+    const auto before=stage.transform({1400,600,900});
+    stage.place(7,{5000,300,-4000},heading+pi); // movement/native camera cut
+    EXPECT_EQ(stage.heading,heading);EXPECT_EQ(stage.transform({1400,600,900}),before);
+  }
+}
+
+TEST(MgsVrView, NativeRadarTile1ReplaysAtTheSamePixelOnBothPages) {
+  struct Cleanup {~Cleanup(){games::mgs::configure(false,false);}} cleanup;
+  games::mgs::configure(true,false);
+  for(uint32_t page:{0u,320u}) for(bool blinkOn:{false,true}) {
+    gpu::GPU native,captured;
+    captured.configureReplay({true,4,true,true,replay::ReplayDepthMode::Hybrid});
+    for(auto *gpu:{&native,&captured}) {
+      gpu->writeGP0(0xE3000000u|(16u<<10)|(page+235));
+      gpu->writeGP0(0xE4000000u|(67u<<10)|(page+303));
+      gpu->writeGP0(0xE5000000u|(42u<<11)|(page+269));
+      // Native radar.c TILE1 source: local0,0 and C8C8C8, only on blink frames.
+      if(blinkOn) { gpu->writeGP0(0x68C8C8C8);gpu->writeGP0(0); }
+    }
+    EXPECT_EQ(native.getVRAM()[42*1024+page+269].raw,captured.getVRAM()[42*1024+page+269].raw);
+    EXPECT_EQ(native.getVRAM()[42*1024+page+269].raw!=0,blinkOn);
+    captured.snapshotDisplayBuffer(1);
+    const auto frame=captured.tryConsumeReplay();ASSERT_TRUE(frame);
+    EXPECT_EQ(mgsHasPanelContent(frame->operations(),320,224),blinkOn);
+    unsigned points=0;
+    for(const auto &op:frame->operations()) if(const auto *paint=std::get_if<replay::PaintRect>(&op)) {
+      ++points;
+      const auto packet=mgsHudPaintRect(*paint,320,224);ASSERT_TRUE(packet);
+      EXPECT_EQ(packet->vertices[0].nativeX,int(page+269));
+      EXPECT_EQ(packet->vertices[0].nativeY,42);
+      EXPECT_EQ(packet->vertices[3].nativeX,int(page+270));
+      EXPECT_EQ(packet->vertices[3].nativeY,43);
+      EXPECT_EQ(packet->vertices[0].color,(replay::Rgb8{200,200,200}));
+      EXPECT_EQ(mgsHudPage(packet->state.drawArea),page);
+      EXPECT_EQ(packet->vertices[0].x-page,269); // no second drawOffset subtraction
+    }
+    EXPECT_EQ(points,blinkOn?1u:0u);
+  }
+}
+
+TEST(MgsVrView, RecordedPaintRectBackgroundIsNotAWorldHudPlate) {
+  for(uint32_t page:{0u,320u}) {
+    replay::CrashReplayRecorder recorder({true,4,true,true,replay::ReplayDepthMode::Hybrid});
+    std::vector<gpu::Color16> vram(replay::CrashReplayRecorder::NATIVE_PIXEL_COUNT);
+    recorder.recordSurfaceSeed(vram);
+    for(const replay::NativeRect rect: {replay::NativeRect{int32_t(page),0,320,224},
+        replay::NativeRect{int32_t(page+235),16,69,52}}) {
+      replay::PaintRect paint;paint.destination=rect;
+      paint.depth.invalidateOnAccepted=true;paint.coalescedCommandCount=uint64_t(rect.width)*rect.height;
+      recorder.observeOpcode(0x68);recorder.recordPaintRect(0x68,paint);
+    }
+    const auto frame=recorder.sealAndPublish({});ASSERT_TRUE(frame);
+    EXPECT_TRUE(mgsHasPanelContent(frame->operations(),320,224));
+    unsigned seen=0;
+    for(const auto &op:frame->operations()) if(const auto *paint=std::get_if<replay::PaintRect>(&op)) {
+      const auto packet=mgsHudPaintRect(*paint,320,224);ASSERT_TRUE(packet);
+      EXPECT_EQ(isMgsHudBackground(*packet,page,320,224),seen==0);
+      EXPECT_FALSE(isMgsEyeOverlay(*packet,page,320,224));
+      ++seen;
+    }
+    EXPECT_EQ(seen,2u);
+  }
 }
 
 TEST(MgsVrView, GameplayHudFollowsHeadForwardAndRemovesRoll) {
@@ -353,7 +480,7 @@ TEST_F(MgsVrMovement, WallCameraAdmissionKeepsNativeActionsAndRejectsAuthoredVie
     const auto view = games::mgs::capturePlayerView(scene, memory);
     ASSERT_TRUE(view);
     EXPECT_EQ(view->bodyLifetime, body.lifetime);
-    EXPECT_EQ(view->eye, (std::array<float, 3>{100,1600,260}));
+    EXPECT_EQ(view->eye, (std::array<float, 3>{100,1550,260}));
     // Admission never turns wall handling into modern locomotion.
     input::VrInputSample movement; movement.facing = 1024; movement.movementHeading = 2048;
     games::mgs::setVrMovement(movement);
@@ -375,11 +502,104 @@ TEST_F(MgsVrMovement, WallCameraAdmissionKeepsNativeActionsAndRejectsAuthoredVie
   memory.write32(0x800AE1C8, 0); // behind camera without wall status
   EXPECT_FALSE(games::mgs::capturePlayerView(scene, memory));
   memory.write32(0x800AE1C8, 0x10000);
-  memory.write32(actor + 0x9c4, 0x80054C6C); // normal run is not wall admission
+  memory.write32(actor + 0x9c4, 0x80055044); // unknown adjacent callback is not wall admission
   EXPECT_FALSE(games::mgs::capturePlayerView(scene, memory));
   memory.write32(actor + 0x9c4, 0x80055040);
   memory.write32(actor + 20, 0); // actor authentication is still required
   EXPECT_FALSE(games::mgs::capturePlayerView(scene, memory));
+}
+
+TEST_F(MgsVrMovement, GameplayPauseMenusKeepWorldWhileCodecAndScriptsRemainCinema) {
+  games::mgs::SceneSnapshot scene;scene.epoch=5;
+  games::mgs::SceneInstance body;
+  body.guestAddress=actor+0x3000;body.lifetime=9;body.visible=true;body.models.resize(7);
+  body.models[6].presentationWorld={1,0,0,0,0,1,0,0,0,0,1,0,100,1500,200,1};
+  scene.instances.push_back(body);memory.write32(control+0x7c,body.guestAddress);
+  replay::DrawPacket world;world.route=replay::PacketRoute::Projected3D;
+  world.originalMesh.emplace();world.originalMesh->sourceTopology=true;
+  world.originalMesh->temporalIdentity[0]=scene.epoch;
+  std::vector<replay::Operation> operations{world};
+  for(uint32_t pause:{0u,2u,4u,6u}) {
+    memory.write32(0x800AE0A0,pause);
+    const auto player=games::mgs::capturePlayerView(scene,memory);ASSERT_TRUE(player);
+    EXPECT_EQ(player->paused,pause!=0);
+    EXPECT_EQ(mgsPresentation(operations,player),MgsPresentation::Gameplay);
+    replay::DrawPacket codec;codec.screenEffect.kind=replay::MgsScreenEffectKind::CodecScreen;
+    auto call=operations;call.push_back(codec);
+    EXPECT_EQ(mgsPresentation(call,player),MgsPresentation::Cinema);
+  }
+  for(uint32_t pause:{1u,8u,12u}) {
+    memory.write32(0x800AE0A0,pause);
+    const auto player=games::mgs::capturePlayerView(scene,memory);
+    EXPECT_FALSE(player);EXPECT_EQ(mgsPresentation(operations,player),MgsPresentation::Cinema);
+  }
+  memory.write32(0x800AE0A0,4);
+  for(uint32_t scripted:{0x4000000u,0x8000000u,0x10000000u,0x40000000u,0x80000000u}) {
+    memory.write32(0x800ADB3C,scripted);
+    const auto player=games::mgs::capturePlayerView(scene,memory);
+    EXPECT_FALSE(player);EXPECT_EQ(mgsPresentation(operations,player),MgsPresentation::Cinema);
+  }
+  EXPECT_EQ(mgsPresentation(operations,{}),MgsPresentation::Cinema); // title source models, no Snake
+}
+
+TEST_F(MgsVrMovement, OrdinaryCameraHintsKeepWorldWithoutChangingNativeInput) {
+  games::mgs::SceneSnapshot scene;scene.epoch=5;
+  games::mgs::SceneInstance body;body.guestAddress=actor+0x3000;body.lifetime=9;
+  body.visible=true;body.models.resize(7);
+  body.models[6].presentationWorld={1,0,0,0,0,1,0,0,0,0,1,0,100,1500,200,1};
+  scene.instances.push_back(body);memory.write32(control+0x7c,body.guestAddress);
+  constexpr std::array<uint32_t,8> entry{0x27bdffd8,0xafb00018,0x00808021,0x24040800,
+      0xafbf0020,0x0c0142c1,0xafb1001c,0x1440000b};
+  for(unsigned i=0;i<entry.size();++i)memory.write32(0x800599AC+i*4,entry[i]);
+  replay::DrawPacket world;world.originalMesh.emplace();world.originalMesh->sourceTopology=true;
+  world.originalMesh->temporalIdentity[0]=scene.epoch;
+  std::vector<replay::Operation> operations{world};
+  input::VrInputSample movement;movement.facing=1024;movement.movementHeading=2048;
+  games::mgs::setVrMovement(movement);games::mgs::setVrWeaponPose({});
+  memory.write32(ctx.r28+0x920,3072);memory.write16(control+10,123);
+  memory.write16(control+0x44,60);memory.write16(control+0x48,80);
+  for(uint32_t handler:{0x80054854u,0x800549D8u,0x80054B50u,0x80054C6Cu,
+      0x80054E80u,0x80055B6Cu,0x800599ACu}) for(uint32_t pause:{0u,2u,4u})
+      for(uint32_t hints:{0x10u,0x40u,0x80000u,0x80050u}) {
+    SCOPED_TRACE(handler);
+    SCOPED_TRACE(pause);
+    SCOPED_TRACE(hints);
+    memory.write32(actor+0x9c4,handler);memory.write32(0x800AE0A0,pause);
+    memory.write32(0x800ADB3C,hints);memory.write32(0x800AE1C8,handler==0x800599AC?0x800:0x10);
+    const auto player=games::mgs::capturePlayerView(scene,memory);ASSERT_TRUE(player);
+    EXPECT_EQ(mgsPresentation(operations,player),MgsPresentation::Gameplay);
+    EXPECT_EQ(player->paused,pause!=0);
+    const std::vector<uint8_t> before(memory.ramPtr(),memory.ramPtr()+Memory::RAM_SIZE);
+    mgsApplyVrLocomotion(&ctx);mgsApplyVrControl(&ctx);
+    EXPECT_EQ(std::memcmp(before.data(),memory.ramPtr(),before.size()),0);
+    replay::DrawPacket codec;codec.screenEffect.kind=replay::MgsScreenEffectKind::CodecScreen;
+    auto call=operations;call.push_back(codec);
+    EXPECT_EQ(mgsPresentation(call,player),MgsPresentation::Cinema);
+  }
+  // Same hints plus a real authored/game-over flag still reject ordinary Snake.
+  memory.write32(actor+0x9c4,0x80054C6C);memory.write32(0x800AE0A0,0);
+  for(uint32_t flag:{0x4000000u,0x8000000u,0x10000000u,0x40000000u,0x80000000u}) {
+    memory.write32(0x800ADB3C,0x80050|flag);
+    EXPECT_FALSE(games::mgs::capturePlayerView(scene,memory));
+  }
+  memory.write32(0x800ADB3C,0x80050);
+  for(uint32_t status:{0x80u,0x200u,0x2000u,0x20000000u}) {
+    memory.write32(0x800AE1C8,status);
+    EXPECT_FALSE(games::mgs::capturePlayerView(scene,memory));
+  }
+  memory.write32(0x800AE1C8,0);
+  for(uint32_t handler:{0x800599A8u,0x80055040u,0x800599ACu}) {
+    memory.write32(actor+0x9c4,handler);memory.write16(0x800B752C,2); // not SOCOM/FAMAS
+    const auto unknown=games::mgs::capturePlayerView(scene,memory);
+    EXPECT_FALSE(unknown);EXPECT_EQ(mgsPresentation(operations,unknown),MgsPresentation::Cinema);
+  }
+  memory.write16(0x800B752C,0);memory.write32(0x800599AC,0); // wrong retail entry
+  EXPECT_FALSE(games::mgs::capturePlayerView(scene,memory));
+  // Authentic continuation's first rejected state was death, not alert onset.
+  memory.write32(actor+0x9c4,0x80054C6C);
+  memory.write32(0x800ADB3C,0x10086000);memory.write32(0x800AE1C8,0x20c08100);
+  const auto dead=games::mgs::capturePlayerView(scene,memory);
+  EXPECT_FALSE(dead);EXPECT_EQ(mgsPresentation(operations,dead),MgsPresentation::Cinema);
 }
 
 TEST_F(MgsVrMovement, EyeOffsetFollowsTheRenderedHeadPose) {
@@ -396,12 +616,12 @@ TEST_F(MgsVrMovement, EyeOffsetFollowsTheRenderedHeadPose) {
   memory.write32(control + 0x7c, body.guestAddress);
   const auto view = games::mgs::capturePlayerView(scene, memory);
   ASSERT_TRUE(view);
-  EXPECT_EQ(view->eye, (std::array<float, 3>{160,1600,200}));
+  EXPECT_EQ(view->eye, (std::array<float, 3>{160,1550,200}));
   // Native crawl clearance remains an independent world-up adjustment.
   memory.write32(0x800AE1C8, 0x40);
   const auto prone = games::mgs::capturePlayerView(scene, memory);
   ASSERT_TRUE(prone);
-  EXPECT_EQ(prone->eye, (std::array<float, 3>{160,1920,200}));
+  EXPECT_EQ(prone->eye, (std::array<float, 3>{160,1870,200}));
 }
 
 #include "../../ps1Runtime/src/vr/arm_ik.h"
@@ -591,6 +811,56 @@ void writeTestMatrix(Memory &memory,uint32_t address,const Matrix &m) {
   }
 }
 }
+TEST_F(MgsVrMovement, RetailFirearmHeadYawChangesOnlyTwoRotationFields) {
+  constexpr uint32_t liveControl=0x8016ca80,liveActor=liveControl-0x20;
+  constexpr std::array<uint32_t,8> entry{0x27bdffd8,0xafb00018,0x00808021,0x24040800,
+      0xafbf0020,0x0c0142c1,0xafb1001c,0x1440000b};
+  memory.write32(0x800AE16C,liveControl);memory.write32(liveActor+20,name);
+  for(unsigned i=0;i<entry.size();++i)memory.write32(0x800599AC+i*4,entry[i]);
+  // Distinct native position, step, roll and pad direction witnesses.
+  for(unsigned offset=0;offset<0x70;offset+=2)memory.write16(liveControl+offset,0x1200+offset);
+  ctx.r18=liveActor;ctx.r4=liveControl;ctx.r28=0x800ad9fc;ctx.r29=0x800aeac0;
+  memory.write32(ctx.r28+0x920,2048);
+  games::mgs::setVrWeaponPose({});games::mgs::setVrShotDirection({});
+  for(unsigned mode=0;mode<10;++mode) {
+    SCOPED_TRACE(mode);
+    const bool admitted=mode<3; // SOCOM, FAMAS, normal shoot-helper exit
+    memory.write32(liveActor+0x9c4,mode==4?0x80055040u:0x800599ACu);
+    memory.write16(0x800B752C,mode==1?1:mode==3?2:0);
+    memory.write32(0x800AE1C8,mode==2?0:mode==5?0x880u:0x800u);
+    memory.write32(0x800ADB3C,mode==6?0x40u:0);
+    memory.write32(0x800AE0A0,mode==7?4:0);
+    memory.write32(0x800599AC,mode==8?0:entry[0]);
+    ctx.r31=mode==9?0x8005D100u:0x8005D0FCu;
+    for(const auto aim:std::array<std::array<int,2>,5>{{{1024,256},{1024,-384},{1024,0},{3072,-384},{0,0}}}) {
+      SCOPED_TRACE(aim[0]);
+      input::VrInputSample sample;sample.facing=aim[0];sample.aimPitch=aim[1];sample.movementHeading=2048;
+      games::mgs::setVrMovement(sample);
+      const std::vector<uint8_t> before(memory.ramPtr(),memory.ramPtr()+Memory::RAM_SIZE);
+      mgsApplyVrLocomotion(&ctx);
+      ASSERT_EQ(std::memcmp(before.data(),memory.ramPtr(),before.size()),0);
+      auto expected=before;
+      if(admitted) for(const auto field:std::array<std::array<unsigned,2>,2>{{
+          {10,uint16_t(aim[0])},{0x4e,uint16_t(aim[0])}}}) {
+        const auto offset=(liveControl&0x1fffffff)+field[0];
+        expected[offset]=uint8_t(field[1]);expected[offset+1]=uint8_t(field[1]>>8);
+      }
+      mgsApplyVrControl(&ctx);
+      EXPECT_EQ(std::memcmp(expected.data(),memory.ramPtr(),expected.size()),0);
+      // Production supplies no shot override. Native gun orientation and
+      // translation survive the actual authenticated NewBullet hook exactly.
+      const auto returnPc=ctx.r31;
+      ctx.r4=ctx.r29+16;ctx.r5=1;ctx.r31=mode==1?0x800682D8:0x80067B7C;
+      auto shot=arm::identity();shot[12]=321;shot[13]=654;shot[14]=-987;
+      writeTestMatrix(memory,ctx.r4,shot);
+      const std::vector<uint8_t> beforeShot(memory.ramPtr(),memory.ramPtr()+Memory::RAM_SIZE);
+      mgsApplyVrBulletAim(&ctx);
+      EXPECT_EQ(std::memcmp(beforeShot.data(),memory.ramPtr(),beforeShot.size()),0);
+      ctx.r4=liveControl;ctx.r31=returnPc;
+    }
+  }
+}
+
 TEST_F(MgsVrMovement, RetailFirearmFiringKeepsTrackedArmsAndShotWithoutOverridingMovement) {
   // Actual USA candidate5 shot16082 identity/handler/status, not a locomotion
   // callback substituted to make the weapon bridge pass.
@@ -636,11 +906,19 @@ TEST_F(MgsVrMovement, RetailFirearmFiringKeepsTrackedArmsAndShotWithoutOverridin
     const auto view=games::mgs::capturePlayerView(scene,memory);
     if(admitted) { ASSERT_TRUE(view);EXPECT_EQ(view->arms[0].owners[2],hand); }
     else EXPECT_TRUE(!view || view->arms[0].owners[2]==0);
-    // Even this admitted firing action keeps native facing, step and turning.
+    // The firing hook follows head rotation without redirecting native step.
     ctx.r4=liveControl;ctx.r31=0x8005D0FC;
     const std::vector<uint8_t> beforeMove(memory.ramPtr(),memory.ramPtr()+Memory::RAM_SIZE);
-    mgsApplyVrLocomotion(&ctx);mgsApplyVrControl(&ctx);
+    mgsApplyVrLocomotion(&ctx);
     EXPECT_EQ(std::memcmp(beforeMove.data(),memory.ramPtr(),beforeMove.size()),0);
+    auto expectedMove=beforeMove;
+    if(admitted) for(unsigned offset:{10u,0x4eu}) {
+      const uint16_t value=1024;
+      expectedMove[(liveControl&0x1fffffff)+offset]=uint8_t(value);
+      expectedMove[(liveControl&0x1fffffff)+offset+1]=uint8_t(value>>8);
+    }
+    mgsApplyVrControl(&ctx);
+    EXPECT_EQ(std::memcmp(expectedMove.data(),memory.ramPtr(),expectedMove.size()),0);
     // Publish even on rejected cases to prove the guest boundary fails closed
     // if an old renderer sample races an authored-action transition.
     games::mgs::setVrWeaponPose({hand,desired,native.world});

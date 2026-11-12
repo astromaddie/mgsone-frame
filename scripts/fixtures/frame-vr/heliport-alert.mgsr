@@ -1,0 +1,17 @@
+MGSROUTE 1
+STEP clear-entry-crate 1200 1
+UNTIL x min 4500 4294967295
+GUARD current_stage eq s01a 4294967295
+GUARD story eq 18 4294967295
+GUARD life min 1 4294967295
+GUARD game_over_timer eq 0 4294967295
+MOVE 6000 20452
+END
+STEP first-natural-alert 3000 1
+UNTIL alert_mode min 1 4294967295
+GUARD current_stage eq s01a 4294967295
+GUARD story eq 18 4294967295
+GUARD life min 1 4294967295
+GUARD game_over_timer eq 0 4294967295
+MOVE 9500 -10000
+END

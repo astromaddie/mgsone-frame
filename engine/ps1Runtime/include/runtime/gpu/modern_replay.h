@@ -755,6 +755,7 @@ struct MgsPlayerView {
   uint16_t yaw = 0;
   uint16_t padOrigin = 0;
   std::array<MgsArmPose, 2> arms{}; // right, left; empty during authored actions
+  bool paused = false; // native Start/item/weapon pause: keep world, use native UI input
   bool operator==(const MgsPlayerView &) const = default;
 };
 

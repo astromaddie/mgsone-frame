@@ -404,6 +404,8 @@ struct Renderer::Impl {
   std::vector<Material> materials;
   // Headless-only provenance parallel to materials; points into retained frames.
   std::vector<const replay::DrawPacket *> materialSources;
+  std::vector<replay::DrawPacket> hudPaintPackets;
+  uint64_t hudPaintCommands=0;
   std::vector<const replay::DrawPacket *> transparent;
   std::array<EyeView, 2> eyes{};
   Anchor anchor{}, panelAnchor{}, toyboxAnchor{};
@@ -808,6 +810,8 @@ struct Renderer::Impl {
     const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     vkCheck(vkCreateFence(device(), &fenceInfo, nullptr, &fence), "Create VR completion fence");
 
+    games::mgs::setVrWeaponPose({});
+    games::mgs::setVrShotDirection({});
     games::mgs::setMeshReplayStereo(true);
     games::mgs::setSceneAssetCache(&assets->assets());
     cacheBound = true;
@@ -968,7 +972,7 @@ struct Renderer::Impl {
       out << "side " << side << " active " << armSolutions[side].active << " weight " << armState[side].weight << '\n';
       for(unsigned joint=0;joint<3;++joint) {
         const auto a=arm::position(player.arms[side].world[joint]);
-        const auto b=arm::position(armSolutions[side].world[joint]);
+        const auto b=armSolutions[side].active ? arm::position(armSolutions[side].world[joint]) : a;
         out << "joint " << joint << " owner " << player.arms[side].owners[joint] << " native " << a[0] << ' ' << a[1] << ' ' << a[2]
             << " solved " << b[0] << ' ' << b[1] << ' ' << b[2] << '\n';
       }
@@ -1070,11 +1074,14 @@ struct Renderer::Impl {
         ? mgsPresentation(frame->operations(), frame->latch().mgsPlayerView)
         : MgsPresentation::Reuse;
     const auto aperture = deriveDisplayAperture(display, DisplayAreaPolicy::Programmed);
+    const bool pausedWorld=frame && worldFrame && frame->latch().mgsPlayerView &&
+        frame->latch().mgsPlayerView->paused && worldFrame->latch().mgsPlayerView &&
+        frame->latch().mgsPlayerView->sceneEpoch==worldFrame->latch().mgsPlayerView->sceneEpoch &&
+        frame->latch().mgsPlayerView->bodyLifetime==worldFrame->latch().mgsPlayerView->bodyLifetime;
     if (presentation == MgsPresentation::Cinema || !aperture.enabled ||
-        builtFrame < lastWorld || builtFrame - lastWorld > 6)
+        builtFrame < lastWorld || (!pausedWorld && builtFrame - lastWorld > 6))
       worldFrame.reset();
-    if (frame && std::any_of(frame->operations().begin(), frame->operations().end(),
-        [](const auto &op) { return std::holds_alternative<replay::DrawPacket>(op); }))
+    if (frame && mgsHasPanelContent(frame->operations(),aperture.width,aperture.height))
       panelFrame = frame;
     if (presentation == MgsPresentation::Gameplay) {
       worldFrame = frame;
@@ -1087,6 +1094,7 @@ struct Renderer::Impl {
     panoramaRejected = 0;
     materials.clear();
     materialSources.clear();
+    hudPaintPackets.clear();hudPaintCommands=0;
     transparent.clear();
     playerCamera.reset();
     worldFaces = solidVertices = worldVertices = bodyFaces = 0;
@@ -1105,7 +1113,7 @@ struct Renderer::Impl {
           Vec3 centre{};
           if (player) { centre = player->eye; centre[1] -= 1500; }
           else meshPosition(assets->assets().bytes(), mesh, 0, centre);
-          toybox.place(epoch, centre);
+          toybox.place(epoch, centre, player ? Toybox::nativeUpHeading(player->padOrigin) : 0);
           toyboxAnchor = recenter(eyes);
         }
       }
@@ -1162,8 +1170,15 @@ struct Renderer::Impl {
     }
     if (panelFrame && worldFaces) {
       std::optional<uint32_t> enclosingPage;
+      hudPaintPackets.reserve(panelFrame->operations().size());
       for (const auto &op : panelFrame->operations()) {
         const auto *packet = std::get_if<replay::DrawPacket>(&op);
+        if(const auto *paint=std::get_if<replay::PaintRect>(&op)) {
+          if(auto lowered=mgsHudPaintRect(*paint,aperture.width,aperture.height)) {
+            hudPaintPackets.push_back(*lowered);packet=&hudPaintPackets.back();
+            hudPaintCommands+=paint->coalescedCommandCount;
+          }
+        }
         if (!packet) continue;
         const auto pageX = mgsHudPage(packet->state.drawArea, enclosingPage);
         if (pageX) enclosingPage = pageX;
@@ -1273,7 +1288,7 @@ struct Renderer::Impl {
 
   void drawEyes(const std::array<EyeView, 2> &views, bool readPixels = true) {
     const Anchor overlayAnchor = worldFaces ? hudAnchor(views) : panelAnchor;
-    const bool showAim = playerCamera && pad.aimValid;
+    const bool showAim = false; // Native weapons; no hand-driven aiming beam.
     std::array<Vertex, 18> reticle{};
     if (showAim) {
       const auto &q = pad.aimPose.orientation;
@@ -1433,6 +1448,8 @@ Renderer::~Renderer() = default;
 bool Renderer::beginFrame(input::VrInputSample &sample) {
   auto &state = *impl_;
   sample = {};
+  // Native gun orientation/autotarget owns shots. HMD pitch changes only view.
+  games::mgs::setVrShotDirection({});
   if (state.offscreen()) {
     if (state.headlessHz) {
       const auto now = std::chrono::steady_clock::now();
@@ -1440,7 +1457,8 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
       state.headlessNext = std::max(state.headlessNext + period, now);
       std::this_thread::sleep_until(state.headlessNext);
     }
-    if (state.playerCamera && state.worldFrame) {
+    if (state.playerCamera && state.worldFrame &&
+        !(state.panelFrame && state.panelFrame->latch().mgsPlayerView && state.panelFrame->latch().mgsPlayerView->paused)) {
       sample.facing = input::vrHeading(state.baseHeading);
       const auto &player = *state.worldFrame->latch().mgsPlayerView;
       if (const char *heading = std::getenv("PS1_VR_HEADLESS_MOVE_YAW");
@@ -1459,24 +1477,21 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
       }
       if (const char *heading = std::getenv("PS1_VR_HEADLESS_AIM_YAW")) {
         const float angle = std::strtof(heading, nullptr);
-        const char *pitchValue = std::getenv("PS1_VR_HEADLESS_AIM_PITCH");
-        const float pitch = pitchValue ? std::strtof(pitchValue, nullptr) : 0;
-        const float horizontal = std::cos(pitch);
-        games::mgs::setVrShotDirection({std::sin(angle) * horizontal, std::sin(pitch),
-                                      std::cos(angle) * horizontal});
-        const float halfYaw = (angle - state.baseHeading) * 0.5f;
-        const float halfPitch = pitch * 0.5f;
-        const Quaternion q{std::cos(halfYaw) * std::sin(halfPitch),
-                           std::sin(halfYaw) * std::cos(halfPitch),
-                           -std::sin(halfYaw) * std::sin(halfPitch),
-                           std::cos(halfYaw) * std::cos(halfPitch)};
-        state.pad.aimPose = {{q[0], q[1], q[2], q[3]}, {0.18f, -0.16f, -0.3f}};
-        state.pad.aimValid = true;
-        // The diagnostic fire input still goes through the original pad.
-        sample.facing = uint16_t(int32_t(std::lround(angle *
-            (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
-        sample.aimPitch = int16_t(std::lround(-pitch *
-            (4096 / (2 * std::numbers::pi_v<float>))));
+        if(std::isfinite(angle)) sample.facing=input::vrHeading(angle);
+        // Legacy AIM_PITCH is ignored. down60/down85 capture views look down
+        // without changing Snake's native root, weapon or bullet matrix.
+      }
+    }
+    if (!state.firstPerson && state.worldFaces && state.worldFrame &&
+        !(state.panelFrame && state.panelFrame->latch().mgsPlayerView && state.panelFrame->latch().mgsPlayerView->paused)) {
+      const char *x=std::getenv("PS1_VR_HEADLESS_MOVE_X"),*y=std::getenv("PS1_VR_HEADLESS_MOVE_Y");
+      if(x || y) {
+        const float right=x?std::strtof(x,nullptr):0,forward=y?std::strtof(y,nullptr):0;
+        if(std::isfinite(right) && std::isfinite(forward)) {
+          const auto stick=input::headRelativeStick(right,forward,state.toybox.heading,
+              state.worldFrame->latch().mgsPlayerView->padOrigin);
+          sample.analogMovement=true;sample.x=stick[0];sample.y=stick[1];
+        }
       }
     }
     return true;
@@ -1514,9 +1529,11 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
     if (trigger) sample.buttons |= input::BTN_SQUARE;
     if (state.pad.grip > 0.65f) sample.buttons |= input::BTN_R2;
   }
-  if (!focused || !state.playerCamera || !state.pad.aimValid)
+  const bool pausedView=state.panelFrame && state.panelFrame->latch().mgsPlayerView &&
+                        state.panelFrame->latch().mgsPlayerView->paused;
+  if (!focused || !state.playerCamera || pausedView)
     games::mgs::setVrShotDirection({});
-  if (!focused || !state.playerCamera) games::mgs::setVrMovement({});
+  if (!focused || !state.playerCamera || pausedView) games::mgs::setVrMovement({});
   if (!state.canDraw) {
     state.xr.end(false);
     return false;
@@ -1533,7 +1550,7 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
     state.panelLogReasons |= 1;
   }
   if (view.recenter) state.recenterRoom();
-  if (focused && state.playerCamera && state.worldFrame) {
+  if (focused && !pausedView && state.playerCamera && state.worldFrame) {
     const auto &player = *state.worldFrame->latch().mgsPlayerView;
     constexpr float turnSpeed = std::numbers::pi_v<float> / 2;
     const float period = std::clamp(float(state.xr.frameState.predictedDisplayPeriod) * 1e-9f,
@@ -1560,21 +1577,17 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
     sample.y = stick[1];
     sample.facing = uint16_t(int32_t(std::lround(heading *
         (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
-    if (state.pad.aimValid) {
-      const auto &q = state.pad.aimPose.orientation;
-      const auto aim = rotate(inverse(state.anchor.heading),
-                              rotate({q.x, q.y, q.z, q.w}, {0, 0, -1}));
-      const float aimHeading = state.baseHeading - state.stickTurn - std::atan2(aim[0], -aim[2]);
-      const float horizontal = std::hypot(aim[0], aim[2]);
-      games::mgs::setVrShotDirection({std::sin(aimHeading) * horizontal, aim[1],
-                                    std::cos(aimHeading) * horizontal});
-      if (sample.buttons & input::BTN_SQUARE) {
-        sample.facing = uint16_t(int32_t(std::lround(aimHeading *
-            (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
-        sample.aimPitch = int16_t(std::lround(-std::atan2(aim[1], horizontal) *
-            (4096 / (2 * std::numbers::pi_v<float>))));
-      }
+  } else if (focused && !pausedView && state.worldFaces && state.worldFrame && state.toybox.placed) {
+    // The stage stays fixed while native padOrigin follows room camera cuts.
+    // Compensate only the pad direction; native Snake decides how to turn/run.
+    const auto &player=*state.worldFrame->latch().mgsPlayerView;
+    float right=state.pad.move.x,forward=state.pad.move.y;
+    if(std::hypot(right,forward)<0.25f) {
+      right=float(bool(sample.buttons&input::BTN_RIGHT))-float(bool(sample.buttons&input::BTN_LEFT));
+      forward=float(bool(sample.buttons&input::BTN_UP))-float(bool(sample.buttons&input::BTN_DOWN));
     }
+    const auto stick=input::headRelativeStick(right,forward,state.toybox.heading,player.padOrigin);
+    sample.analogMovement=true;sample.x=stick[0];sample.y=stick[1];
   }
   return focused;
 }
@@ -1583,8 +1596,9 @@ void Renderer::present() {
   auto &state = *impl_;
   if (!state.offscreen() && !state.canDraw) return;
   state.updateScene();
-  state.diagnosticHands();
-  state.updateArms();
+  // Native body, arms and weapon animation in every production presentation.
+  // The standalone IK math remains testable, but no controller pose is published.
+  state.resetArms();
   state.logPanelPlacement();
   if (state.offscreen()) {
     if (state.headlessHz) {
@@ -1638,6 +1652,7 @@ void Renderer::present() {
          << " toybox_centre=" << state.toybox.centre[0] << ',' << state.toybox.centre[1] << ',' << state.toybox.centre[2]
          << " vertices=" << state.vertices.size() << " panel_vertices=" << state.vertices.size()-state.worldVertices
          << " panorama_rejected=" << state.panoramaRejected << " eye_overlays=" << state.eyeOverlays.size()
+         << " hud_paint_commands=" << state.hudPaintCommands << " toybox_heading=" << state.toybox.heading
          << " source=" << scanout.sourceByteX << ',' << scanout.sourceY
          << " extent=" << scanout.activeExtent.width << ',' << scanout.activeExtent.height
          << " native_nonblack=" << nonblack << " enabled=" << scanout.enabled << '\n';
@@ -1646,6 +1661,13 @@ void Renderer::present() {
     std::optional<uint32_t> enclosingPage;
     const auto aperture = deriveDisplayAperture(state.display, DisplayAreaPolicy::Programmed);
     if (state.panelFrame) for (const auto &op : state.panelFrame->operations()) {
+      if(const auto *paint=std::get_if<replay::PaintRect>(&op)) {
+        info << "paint_rect xywh=" << paint->destination.x << ',' << paint->destination.y << ','
+             << paint->destination.width << ',' << paint->destination.height
+             << " rgb=" << unsigned(paint->color.r) << ',' << unsigned(paint->color.g) << ',' << unsigned(paint->color.b)
+             << " commands=" << paint->coalescedCommandCount
+             << " hud=" << bool(mgsHudPaintRect(*paint,aperture.width,aperture.height)) << '\n';
+      }
       const auto *packet = std::get_if<replay::DrawPacket>(&op);
       if (!packet) continue;
       const auto &a = packet->state.drawArea;

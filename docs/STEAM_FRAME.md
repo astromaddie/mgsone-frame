@@ -62,9 +62,16 @@ import, settings and saves. The Frame D-pad and left stick move Snake.
 The face buttons, triggers, bumpers, Menu and View map to the original
 controller using the flat build's gamepad layout. Click the right stick to
 switch between first and third person during play.
-In first person, movement follows the headset and the right stick turns the
-view. Point the right controller to aim. The right trigger fires, and the
-right grip opens the weapon menu. The aim marker follows the controller.
+In first person, movement follows the headset's horizontal heading and the
+right stick turns Snake. Looking up or down changes only the view. I keep the
+native arms, weapon animations and gun aiming, including autotarget. Shots
+don't follow the headset's vertical gaze. The right trigger fires, and the
+right grip opens the weapon menu. Hand poses don't move the arms or gun.
+
+Third person uses a fixed tilted tabletop. Movement follows that view even
+when the game's camera cuts. Item and weapon selectors stay over the world,
+with their original navigation. Codec, title screens and video use the cinema
+panel.
 
 ## Evidence
 

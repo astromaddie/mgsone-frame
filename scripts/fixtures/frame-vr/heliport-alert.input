@@ -1,0 +1,9 @@
+# Native pad intervals recorded from heliport-alert.mgsr.
+# The reference loaded checkpoint is VBlank 1565; shift all intervals by the
+# difference if the isolated load session ends at another VBlank.
+1566 1744 right
+1746 2473 up
+2143 2164 right
+2185 2204 right
+2223 2240 right
+2259 2278 right

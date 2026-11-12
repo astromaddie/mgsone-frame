@@ -242,14 +242,16 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   constexpr uint32_t controlOffset = 0x20, bodyPointerOffset = 0x7c;
   constexpr uint32_t headModel = 6;
   const uint32_t status = memory.read32(playerStatus);
-  // Keep the authored views for look mode, vents, cut-ins, scripted scenes,
-  // disguises and incapacitation.
+  // Keep authored player views for look mode, vents, scripted scenes,
+  // disguises and incapacitation. Camera hint bits are handled below.
   constexpr uint32_t authoredPlayerView = 0x20007283;
   constexpr uint32_t authoredGameView = 0xdc080050;
   const bool weaponView = (status & 1u) && int16_t(memory.read16(0x800B752Cu)) >= 0;
   const uint32_t playerViewMask = weaponView ? authoredPlayerView & ~1u : authoredPlayerView;
-  if ((status & playerViewMask) || memory.read32(0x800AE0A0u) != 0)
-    return {};
+  const uint32_t pause=memory.read32(0x800AE0A0u);
+  // Native Start pause(2) and item/weapon selector pause(4) retain gameplay.
+  // STOP(1), disc errors(8) and unknown pause causes keep the cinema fallback.
+  if ((status & playerViewMask) || (pause & ~6u)) return {};
   const uint32_t control = memory.read32(playerControl);
   if (control < 0x80010000u || !range(control, bodyPointerOffset + 4))
     return {};
@@ -266,7 +268,16 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
   const uint32_t handler = memory.read32(control - controlOffset + 0x9c4);
   const bool wallView = (status & 0x10000u) &&
       (handler == 0x80055040u || handler == 0x80055134u || handler == 0x800552B8u);
-  const uint32_t gameViewMask = wallView ? authoredGameView & ~0x10u : authoredGameView;
+  const bool ordinary = handler == 0x80054854u || handler == 0x800549D8u ||
+      handler == 0x80054B50u || handler == 0x80054C6Cu ||
+      handler == 0x80054E80u || handler == 0x80055B6Cu ||
+      isVrFirearmAction(memory, handler, int16_t(memory.read16(0x800B752Cu)));
+  // These bits request native camera/menu presentation, not a scripted scene
+  // by themselves. Keep a verified ordinary Snake action in the 3D view.
+  // This policy is render-only; guest movement/input guards remain unchanged.
+  constexpr uint32_t nativeViewHints = 0x10u | 0x40u | 0x80000u;
+  const uint32_t allowedHints = ordinary ? nativeViewHints : wallView ? 0x10u : 0;
+  const uint32_t gameViewMask = authoredGameView & ~allowedHints;
   if (memory.read32(gameStatus) & gameViewMask) return {};
   const uint32_t body = memory.read32(control + bodyPointerOffset);
   const auto instance = std::find_if(scene.instances.begin(), scene.instances.end(),
@@ -276,24 +287,21 @@ capturePlayerView(const SceneSnapshot &scene, const Memory &memory) {
     return {};
   // Model 6's origin is the head/neck joint, inside the collar, not the eyes.
   // The native head spans local Y=-60..165 and Z=-90..93 game units. Place
-  // the eyes 100mm above and 60mm toward the face, within that head volume.
+  // the eyes 50mm above and 60mm toward the face, within that head volume.
   // Use the same presentation pose as source geometry so float articulation
   // cannot leave the camera at a different native joint position.
   const auto &head = instance->models[headModel].presentationWorld;
   std::array<float, 3> eye{};
   for (unsigned axis = 0; axis < 3; ++axis)
-    eye[axis] = head[12 + axis] + 100.0f * head[4 + axis] + 60.0f * head[8 + axis];
+    eye[axis] = head[12 + axis] + 50.0f * head[4 + axis] + 60.0f * head[8 + axis];
   if (status & 0x40u) eye[1] += 320.0f;
   gpu::replay::MgsPlayerView result{
       scene.epoch, instance->lifetime, eye,
       scene.view, uint16_t(memory.read16(control + 10) & 4095u),
       uint16_t(memory.read32(0x800ADAA8u) & 4095u)};
-  // Keep native authored arms, but retain tracked hands through the verified
-  // SOCOM/FAMAS firing callback. It is deliberately not a locomotion state.
-  const bool ordinary = handler == 0x80054854u || handler == 0x800549D8u ||
-      handler == 0x80054B50u || handler == 0x80054C6Cu ||
-      handler == 0x80054E80u || handler == 0x80055B6Cu ||
-      isVrFirearmAction(memory, handler, int16_t(memory.read16(0x800B752Cu)));
+  result.paused = pause != 0;
+  // Preserve skeletal witnesses for diagnostics and standalone IK tests.
+  // Production rendering keeps native arms; this is not a locomotion gate.
   if (stereoCapture && ordinary && instance->primaryModels == 16 &&
       instance->models.size() >= 16 && !instance->pose.invalidInput &&
       instance->pose.source == ScenePoseSource::Rotations &&

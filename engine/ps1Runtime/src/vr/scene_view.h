@@ -2,6 +2,7 @@
 #include "eye_view.h"
 #include "runtime/gpu/modern_replay.h"
 #include <optional>
+#include <numbers>
 #include <cstdint>
 #include <map>
 #include <cstring>
@@ -52,7 +53,8 @@ inline MgsPresentation mgsPresentation(std::span<const replay::Operation> operat
     source = true;
     // Source geometry also exists in title/menu scenes. The producer's
     // authenticated live Snake/body witness distinguishes playable world
-    // snapshots and already rejects authored views, scripts and pause.
+    // snapshots and already rejects authored views and scripts. Native pause
+    // and selectors retain this witness and their original overlay packets.
     gameplay |= player && packet->originalMesh->temporalIdentity[0] == player->sceneEpoch;
   }
   if (gameplay) return MgsPresentation::Gameplay;
@@ -73,6 +75,38 @@ inline std::optional<uint32_t> mgsHudPage(const replay::DrawArea &area,
   if (previous && area.left < int32_t(*previous + 320) && area.right >= int32_t(*previous))
     return previous;
   return {};
+}
+
+// GP0 TILE1 remains an ordered native PaintRect in the replay recorder. Radar
+// player/enemy dots use this path; their accepted coordinates include DRAWENV.
+inline std::optional<replay::DrawPacket> mgsHudPaintRect(const replay::PaintRect &paint,
+                                                       uint32_t width,uint32_t height) {
+  const auto &r=paint.destination;
+  if(!width || !height || r.width<=0 || r.height<=0 || r.x<0 || r.y<0 ||
+      int64_t(r.x)+r.width>640 || int64_t(r.y)+r.height>height ||
+      paint.mask.checkMaskBit || paint.mask.forceMaskBit) return {};
+  const auto page=mgsHudPage({r.x,r.y,r.x+int32_t(r.width)-1,r.y+int32_t(r.height)-1});
+  if(!page || int64_t(r.x)+r.width>int64_t(*page)+width) return {};
+  replay::DrawPacket packet;
+  packet.opcode=0x60;packet.route=replay::PacketRoute::Screen2D;
+  packet.vertexCount=4;packet.indexCount=6;packet.triangleIndices={0,1,2,1,3,2};
+  packet.state.drawArea={int32_t(*page),0,int32_t(*page+width-1),int32_t(height-1)};
+  for(unsigned i=0;i<4;++i) {
+    auto &v=packet.vertices[i];
+    v.x=v.nativeX=r.x+((i&1)?r.width:0);
+    v.y=v.nativeY=r.y+((i&2)?r.height:0);
+    v.color=paint.color;
+  }
+  return packet;
+}
+
+inline bool mgsHasPanelContent(std::span<const replay::Operation> operations,
+                               uint32_t width,uint32_t height) {
+  return std::any_of(operations.begin(),operations.end(),[&](const auto &op) {
+    if(std::holds_alternative<replay::DrawPacket>(op)) return true;
+    const auto *paint=std::get_if<replay::PaintRect>(&op);
+    return paint && mgsHudPaintRect(*paint,width,height).has_value();
+  });
 }
 
 inline bool isMgsHudCandidate(const replay::DrawPacket &packet) {
@@ -211,18 +245,28 @@ struct Toybox {
   uint64_t epoch = 0;
   bool placed = false;
   Vec3 centre{};
-  // A 1.8m character becomes a 14cm figure. Placement changes only when a
-  // different scene loads, not when the player walks or the channel cuts.
-  static constexpr float scale = 0.08f / 1000.0f;
-  void place(uint64_t scene, Vec3 origin) {
+  float heading = 0;
+  // Fixed tabletop orientation: native camera cuts never rotate the stage.
+  // A 1.8m character is 21.6cm tall, above a table tilted toward the viewer.
+  static constexpr float scale = 0.12f / 1000.0f;
+  static float nativeUpHeading(uint16_t padOrigin) {
+    // libgv/pad.c GetPadDir: Up=2048, Right=1024, Down=0, Left=3072,
+    // then add PadOrg. PadOrg itself is the native DOWN direction.
+    return float((padOrigin+2048u)&4095u)*(2*std::numbers::pi_v<float>/4096);
+  }
+  void place(uint64_t scene, Vec3 origin, float viewHeading = 0) {
     if (placed && epoch == scene) return;
     epoch = scene;
     centre = origin;
+    heading = viewHeading;
     placed = true;
   }
   Vec3 transform(Vec3 p) const {
-    return {-(p[0]-centre[0])*scale, (p[1]-centre[1])*scale-0.9f,
-            -(p[2]-centre[2])*scale-2.4f};
+    for (unsigned axis=0;axis<3;++axis) p[axis]=(p[axis]-centre[axis])*scale;
+    const float c=std::cos(heading),s=std::sin(heading);
+    const float x=-c*p[0]+s*p[2],z=-s*p[0]-c*p[2];
+    constexpr float tilt=0.70710678118f; // 45 degrees, fixed world transform
+    return {x,tilt*(p[1]-z)-0.65f,tilt*(p[1]+z)-1.7f};
   }
 };
 }

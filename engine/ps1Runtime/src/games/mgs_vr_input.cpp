@@ -47,7 +47,7 @@ bool isVrFirearmAction(const Memory &memory, uint32_t handler,
                        int16_t weapon) noexcept {
   if (handler != 0x800599ACu || (weapon != 0 && weapon != 1)) return false;
   // ATTACK clears before this same callback runs its normal exit to idle.
-  // Dropping the wrist in that interval invalidates the learned muzzle offset.
+  // Keep head-facing continuity through that normal exit as well.
   // Authored status/pause/context guards remain mandatory at both callers.
   // USA normal shoot helper: SOCOM and FAMAS share this action. Keep a live
   // entry witness in both capture and guest paths, not an address-only gate.
@@ -76,7 +76,7 @@ void setVrMovement(const input::VrInputSample &sample) noexcept {
   if (sample.facing) {
     packed = movementActive | (*sample.facing & 4095u);
     if (sample.movementHeading) packed |= moveValid | (uint64_t(*sample.movementHeading & 4095u) << 12);
-    if (sample.aimPitch) packed |= pitchValid | (uint64_t(uint16_t(*sample.aimPitch)) << 24);
+    // HMD pitch is view-only; CONTROL X tilts the complete native body root.
   }
   vrMovement.store(packed, std::memory_order_release);
 }
@@ -116,11 +116,6 @@ void vrFacing(ps1::Memory &memory, uint32_t control, uint64_t sample) {
   const uint16_t heading = sample & 4095u;
   memory.write16(control + 10, heading);
   memory.write16(control + 0x4e, heading);
-  if (sample & pitchValid) {
-    const uint16_t pitch = sample >> 24;
-    memory.write16(control + 8, pitch);
-    memory.write16(control + 0x4c, pitch);
-  }
 }
 }
 
@@ -419,7 +414,15 @@ void mgsApplyVrControl(recomp_context *ctx) {
   auto &memory = *ctx->mem;
   if (!vrSnake(memory, control - 0x20, sample, true)) return;
   refreshWeaponConstraint(ctx);
-  if (!vrSnake(memory, control - 0x20, sample)) return;
+  if (!vrSnake(memory, control - 0x20, sample)) {
+    // The authenticated SOCOM/FAMAS shoot helper consumes native movement,
+    // not the published head heading. Follow head yaw through rotation only;
+    // its animation step, position and normal action transitions stay native.
+    vrFacing(memory, control, sample);
+    ps1::metrics::trace("mgs.vr.firearm_facing", {{"facing",int64_t(sample & 4095u)},
+        {"native_pitch",int16_t(memory.read16(control+8))}});
+    return;
+  }
   if (sample & moveValid) {
     const float x = int16_t(memory.read16(control + 0x44));
     const float z = int16_t(memory.read16(control + 0x48));
