@@ -526,6 +526,8 @@ private:
   uint64_t lastLatchedSubmissionId_ = 0;
   replay::CrashReplayRecorder replayRecorder_;
   std::optional<replay::MgsPlayerView> replayPlayerView_;
+  std::optional<replay::MgsCinemaView> replayCinemaView_;
+  bool replayMgsPresentationObserved_ = false;
   uint64_t activeReplayPacketSequence_ = replay::UNASSIGNED_PACKET_SEQUENCE;
   bool activeReplayPacketUnsupported_ = false;
   bool replayPaintCaptureActive_ = false;

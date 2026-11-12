@@ -99,6 +99,7 @@ struct RecoverySource {
   uint64_t capture = 0;
   uint32_t orderingTable = 0;
   std::optional<gpu::replay::MgsPlayerView> playerView;
+  gpu::replay::MgsCinemaView sourceCamera;
   std::vector<RecoveryFace> faces;
 };
 std::array<RecoverySource, 2> recoverySources;
@@ -338,8 +339,13 @@ void prepareFullSourceMeshes(const SceneSnapshot &scene, const Memory &memory,
     return;
   out.capture = scene.sequence;
   out.orderingTable = table & 0x1fffffffu;
-  if (stereoCapture)
+  if (stereoCapture) {
     out.playerView = capturePlayerView(scene, memory);
+    out.sourceCamera.sceneEpoch=scene.epoch;
+    out.sourceCamera.sourceView=scene.view;
+    out.sourceCamera.projection=scene.projection;
+    out.sourceCamera.widescreen=scene.widescreen;
+  }
   uint32_t completeInstances = 0, visibleInstances = 0, visibleFaces = 0;
   for (const auto &instance : scene.instances) {
     if (!instance.visible)
@@ -1412,6 +1418,7 @@ recoverSceneReplay(uint32_t listStart, std::span<const uint8_t> ram) {
   result->capture = source.capture;
   result->orderingTable = source.orderingTable;
   result->playerView = source.playerView;
+  result->sourceCamera = source.sourceCamera;
   uint32_t recovered = 0;
   if (sourceTopologyEnabled) {
     // Paused Codec frames reuse the ordering table after its mesh nodes have

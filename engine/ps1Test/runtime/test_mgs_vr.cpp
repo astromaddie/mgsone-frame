@@ -9,6 +9,7 @@
 #include "runtime/input/host_input.h"
 #include "runtime/input/tas_route.h"
 #include "../../ps1Runtime/src/vr/scene_view.h"
+#include "../../ps1Runtime/src/vr/cinema_view.h"
 #include <gtest/gtest.h>
 #include <cstring>
 #include <iostream>
@@ -1233,4 +1234,165 @@ TEST(MgsVrArms, StraightNativeArmHasNoResidualBendAsTrackingWeightVanishes) {
   }
   const auto final=arm::solve(native,hand,{-1,-1.5f,0},1.0f/120,state);
   EXPECT_FALSE(final.active);EXPECT_EQ(state.weight,0);
+}
+
+TEST(MgsVrCinema, AuthoredCameraPreservesCompositionWithPositiveBoundedStereoDepth) {
+  CinemaView cinema;
+  cinema.source.projection=320;
+  cinema.source.sourceView={0,0,-1,0, 0,1,0,0, 1,0,0,0, 400,-120,800,1};
+  for(bool wide:{false,true}) {
+    cinema.source.widescreen=wide;
+    for(float z:{1.f,100.f,1500.f,10000.f,100000.f}) {
+      const Vec3 world{800-z,220,100};
+      const auto camera=cinema.camera(world),picture=cinema.picture(camera);
+      EXPECT_NEAR(camera[0],wide?375:500,1e-5);
+      EXPECT_NEAR(camera[1],100*58.f/64,1e-5);
+      EXPECT_FLOAT_EQ(camera[2],z);
+      EXPECT_GT(-picture[2],CinemaView::distance);
+      EXPECT_LT(-picture[2],CinemaView::distance+CinemaView::depthRange);
+      // Project back onto the physical window: exactly the original native
+      // pixel composition, independently of the depth compression.
+      const float x=160+picture[0]*2/(-picture[2])*320/1.9f;
+      const float y=112-picture[1]*2/(-picture[2])*224/1.06875f;
+      EXPECT_NEAR(x,160+camera[0]*320/z,0.02);
+      EXPECT_NEAR(y,112+camera[1]*320/z,0.02);
+      const float leftEye=-.032f,rightEye=.032f;
+      // At z=1 this fixture projects hundreds of metres outside the window.
+      // Its ~21 micrometre disparity is smaller than one float ULP there.
+      // Measure the actual float vertices in double precision, rather than
+      // rounding two independent ray intersections to the same float value.
+      const auto atWindow=[&](double eye) {
+        return eye+(double(picture[0])-eye)*2/double(-picture[2]);
+      };
+      EXPECT_LT(atWindow(leftEye),atWindow(rightEye)); // always behind screen
+      EXPECT_GT(atWindow(rightEye)-atWindow(leftEye),0);
+      EXPECT_LT(atWindow(rightEye)-atWindow(leftEye),.064f/3+.00001f);
+      const double geometricDisparity=(double(rightEye)-leftEye)*(1-2/double(-picture[2]));
+      EXPECT_NEAR(atWindow(rightEye)-atWindow(leftEye),geometricDisparity,1e-10);
+      // Visible points must retain the same strict guarantee in production
+      // float precision, including the centre and both sides of the picture.
+      for(float horizontal:{-.9f,0.f,.9f}) {
+        const auto visible=cinema.picture({horizontal*z*.5f,0,z});
+        const auto visibleAtWindow=[&](float eye) {
+          return eye+(visible[0]-eye)*2/(-visible[2]);
+        };
+        EXPECT_LT(visibleAtWindow(leftEye),visibleAtWindow(rightEye));
+        EXPECT_GT(visibleAtWindow(rightEye)-visibleAtWindow(leftEye),0);
+        EXPECT_LT(visibleAtWindow(rightEye)-visibleAtWindow(leftEye),.064f/3+.00001f);
+        EXPECT_LT(std::abs(visibleAtWindow(leftEye)),CinemaView::width/2);
+        EXPECT_LT(std::abs(visibleAtWindow(rightEye)),CinemaView::width/2);
+      }
+    }
+  }
+  // q=d/z cancels the compressed physical depth for native UV/shade
+  // interpolation. Without it a sloped textured face swims across camera cuts.
+  const float z0=200,z1=8000,b=.4f,u0=10,u1=220;
+  const float q0=cinema.perspective(z0),q1=cinema.perspective(z1);
+  const float rendered=((1-b)*u0*q0/cinema.depth(z0)+b*u1*q1/cinema.depth(z1))/
+      ((1-b)*q0/cinema.depth(z0)+b*q1/cinema.depth(z1));
+  const float native=((1-b)*u0/z0+b*u1/z1)/((1-b)/z0+b/z1);
+  EXPECT_NEAR(rendered,native,1e-5);
+}
+
+TEST(MgsVrCinema, NativeCaptionBandIsAdjacentPageIndependentAndBelowBothPictureFormats) {
+  for(float height:{CinemaView::height,CinemaView::height*160/224}) {
+    for(uint32_t page:{0u,320u}) {
+      const auto centre=CinemaView::caption(page+160,204,page,height);
+      EXPECT_FLOAT_EQ(centre[0],0);
+      EXPECT_FLOAT_EQ(centre[1],-height/2-CinemaView::captionHeight/2);
+      EXPECT_FLOAT_EQ(centre[2],-2);
+      // Native font's maximum 38 rows and one-pixel outline fit the band.
+      const auto top=CinemaView::caption(page+40,184,page,height);
+      const auto bottom=CinemaView::caption(page+280,224,page,height);
+      EXPECT_LT(top[1],-height/2);
+      EXPECT_GT(bottom[1],-height/2-CinemaView::captionHeight);
+    }
+  }
+}
+
+TEST(MgsVrCinema, CinemaRequiresLiveProducerAndMatchingCameraWhileCodecAlwaysWins) {
+  replay::DrawPacket source;source.originalMesh.emplace();
+  source.originalMesh->sourceTopology=true;source.originalMesh->temporalIdentity={7,3,0,0};
+  std::vector<replay::Operation> operations{source};
+  replay::MgsCinemaView cinema;cinema.actor=0x100000;cinema.sceneEpoch=7;cinema.projection=320;
+  EXPECT_EQ(mgsPresentation(operations,{},cinema),MgsPresentation::StereoCinema);
+  cinema.sceneEpoch=8;
+  EXPECT_EQ(mgsPresentation(operations,{},cinema),MgsPresentation::Cinema);
+  cinema.sceneEpoch=7;cinema.actor=0;
+  EXPECT_EQ(mgsPresentation(operations,{},cinema),MgsPresentation::Cinema);
+  cinema.actor=0x100000;cinema.projection=0;
+  EXPECT_EQ(mgsPresentation(operations,{},cinema),MgsPresentation::Cinema);
+  cinema.projection=320;
+  EXPECT_EQ(mgsPresentation({}, {},cinema),MgsPresentation::Reuse); // paused DMO camera
+  cinema.kind=replay::MgsCinemaKind::Movie;cinema.moviePicture={0,24,320,160};
+  EXPECT_EQ(mgsPresentation({}, {},cinema),MgsPresentation::MovieCinema);
+  replay::DrawPacket codec;codec.screenEffect.kind=replay::MgsScreenEffectKind::CodecScreen;
+  operations.push_back(codec);
+  EXPECT_EQ(mgsPresentation(operations,{},cinema),MgsPresentation::Cinema);
+  EXPECT_EQ(mgsPresentation(operations,{}),MgsPresentation::Cinema);
+}
+
+TEST(MgsVrCinema, ProductionNearClipKeepsFiniteTexturedCrossingFaces) {
+  struct Vertex {Vec3 position;std::array<float,2> uv;Vec3 shade;};
+  std::vector<Vertex> triangle{{{-3,0,-1},{0,0},{0,0,0}},{{3,0,3},{8,0},{1,1,1}},{{0,3,3},{8,8},{1,1,1}}};
+  const auto clipped=CinemaView::clipNear(triangle);
+  ASSERT_EQ(clipped.size(),4u);
+  CinemaView cinema;cinema.source.projection=320;
+  unsigned intersections=0;
+  for(const auto &v:clipped) {
+    EXPECT_GE(v.position[2],1);
+    for(float component:cinema.picture(v.position)) EXPECT_TRUE(std::isfinite(component));
+    if(v.position[2]==1) {
+      ++intersections;EXPECT_FLOAT_EQ(v.uv[0],4);EXPECT_FLOAT_EQ(v.shade[0],.5);
+    }
+  }
+  EXPECT_EQ(intersections,2u);
+  for(auto &v:triangle)v.position[2]=-1;
+  EXPECT_TRUE(CinemaView::clipNear(triangle).empty());
+}
+
+TEST(MgsVrCinema, RetainedPictureUsesVisiblePixelsAndStillRejectsNativeContextChanges) {
+  std::vector<gpu::Color16> vram(1024*512);
+  gpu::DisplayScanoutPlan plan;plan.activeExtent={320,224};
+  for(unsigned page:{0u,320u})vram[50*1024+page+100].raw=0x1234;
+  const auto original=CinemaPicture::capture(vram,plan);
+  vram[400*1024+900].raw=0x7fff; // offscreen glyph/texture upload
+  EXPECT_EQ(CinemaPicture::capture(vram,plan),original);
+  vram[50*1024+100].raw|=0x8000; // mask bit is not visible
+  EXPECT_EQ(CinemaPicture::capture(vram,plan),original);
+  plan.sourceByteX=640; // identical native display in the other framebuffer
+  EXPECT_EQ(CinemaPicture::capture(vram,plan),original);
+  vram[50*1024+420].raw^=1;EXPECT_NE(CinemaPicture::capture(vram,plan),original);
+  plan.enabled=false;EXPECT_TRUE(CinemaPicture::capture(vram,plan).pixels.empty());
+  replay::MgsCinemaView previous;previous.actor=0x15c3d8;
+  replay::FrameLatch latch;
+  EXPECT_TRUE(retainCinema(MgsPresentation::Reuse,latch,previous,true));
+  EXPECT_FALSE(retainCinema(MgsPresentation::Reuse,latch,previous,false));
+  for(auto presentation:{MgsPresentation::Cinema,MgsPresentation::Gameplay})
+    EXPECT_FALSE(retainCinema(presentation,latch,previous,true)); // title/Codec/live Snake
+  latch.mgsPresentationObserved=true;
+  EXPECT_FALSE(retainCinema(MgsPresentation::Reuse,latch,previous,true)); // explicit end
+  latch.mgsCinemaView=previous;
+  EXPECT_TRUE(retainCinema(MgsPresentation::Reuse,latch,previous,false)); // authenticated new UI/caption
+  latch.mgsCinemaView->actor++;
+  EXPECT_FALSE(retainCinema(MgsPresentation::Reuse,latch,previous,true));
+}
+
+TEST(MgsVrCinema, NativeWaterHalvesMapToTheSamePhysicalSourcePlaneForEachEye) {
+  replay::DrawPacket left,right;
+  for(uint32_t page:{0u,320u}) {
+    left.state.texturePage.raw=uint16_t(0x100+page/64);
+    right.state.texturePage.raw=uint16_t(0x100+(page+128)/64);
+    left.vertices[1].u=160;right.vertices[0].u=32;
+    left.vertices[1].v=right.vertices[0].v=112;
+    const auto a=cinemaWaterSourcePosition(left,1,page),b=cinemaWaterSourcePosition(right,0,page);
+    EXPECT_EQ(a,(Vec3{0,0,-2}));EXPECT_EQ(a,b);
+    EyeView eye;eye.left=eye.down=-1;eye.right=eye.up=1;
+    for(float x:{-.032f,.032f}) {
+      eye.position={x,0,0};const auto m=eyeMatrix({},eye);
+      const float clipX=m[0]*a[0]+m[4]*a[1]+m[8]*a[2]+m[12];
+      const float clipW=m[3]*a[0]+m[7]*a[1]+m[11]*a[2]+m[15];
+      EXPECT_NEAR(clipX/clipW,-x/2,1e-7);
+    }
+  }
 }

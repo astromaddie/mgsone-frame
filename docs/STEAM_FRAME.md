@@ -70,8 +70,10 @@ right grip opens the weapon menu. Hand poses don't move the arms or gun.
 
 Third person uses a fixed tilted tabletop. Movement follows that view even
 when the game's camera cuts. Item and weapon selectors stay over the world,
-with their original navigation. Codec, title screens and video use the cinema
-panel.
+with their original navigation. Scripted 3D cutscenes use a fixed cinema screen,
+with depth behind the picture and the original subtitles in a black band below.
+Prerecorded video keeps its original flat picture in the same layout. Codec and
+title screens keep their complete native panel. Hold View to recentre the screen.
 
 ## Evidence
 

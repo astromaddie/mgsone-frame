@@ -1,6 +1,7 @@
 #include "runtime/games/mgs_profile.h"
 #include "runtime/games/mgs_screen_effects.h"
 #include "runtime/gpu/gpu.h"
+#include "../../ps1Runtime/src/vr/cinema_view.h"
 #include <cstring>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -663,4 +664,155 @@ TEST(MgsScreenEffectsTest, FurnaceProfileRequiresMatchingOwnerNotRedPixels) {
   captureScreenEffects(f.ram);
   bindWaterEffect(p, f.prims + 60);
   EXPECT_FALSE(p.furnaceHeat);
+}
+
+namespace {
+class MgsCinemaProducer : public ::testing::Test {
+protected:
+  std::vector<uint8_t> ram=std::vector<uint8_t>(2*1024*1024);
+  static constexpr uint32_t menu=0x80100000,arena=0x80110000,prims=0x80111000,
+      demo=0x80130000,header=0x80131000,jim=0x800c01d8;
+  void word(uint32_t p,uint32_t v) {
+    for(unsigned i=0;i<4;++i) ram[(p&0x1fffff)+i]=v>>(8*i);
+  }
+  void actor(unsigned level,uint32_t address,const char *name) {
+    const uint32_t head=0x800af390+level*68;
+    word(head+4,address);word(address,head);word(address+4,head+32);
+    word(head+32,address);word(address+8,0x80070000);word(address+20,address+0x200);
+    std::memcpy(ram.data()+(address&0x1fffff)+0x200,name,std::strlen(name)+1);
+  }
+  void SetUp() override {
+    configure(true,false);
+    actor(1,demo,"demothrd.c");word(0x800adb3c,0x80000000);
+    word(demo+44,20);word(demo+48,header);word(header+8,400);
+    actor(7,menu,"menuman.c");word(menu+32,arena);
+    word(arena,prims+108);word(arena+8,prims+4096);word(arena+12,prims);
+    constexpr std::array<uint32_t,10> code{0x27bdffc0,0xafb10034,0x00808821,
+        0xafbf003c,0xafb20038,0xafb00030,0x9222002b,0,0x304200fe,0x10400007};
+    for(unsigned i=0;i<code.size();++i) word(0x8004b770+i*4,code[i]);
+    word(jim,1);word(jim+4,40|(195u<<16));word(jim+8,256|(18u<<16));
+    constexpr std::array<std::array<int,2>,5> offsets{{{0,0},{-1,0},{1,0},{0,1},{0,-1}}};
+    for(unsigned i=0;i<5;++i) {
+      const uint32_t p=prims+i*20;
+      word(p,0x04000000|(i?((p-20)&0xffffff):0xffffff));
+      word(p+4,i?0x64000000:0x64808080);
+      word(p+8,uint16_t(40+offsets[i][0])|(uint32_t(uint16_t(195+offsets[i][1]))<<16));
+      word(p+12,0x7fbc0000);word(p+16,256|(18u<<16));
+    }
+    word(prims+100,0x01000000|((prims+80)&0xffffff));word(prims+104,0xe100041f);
+  }
+  void TearDown() override {configure(false,false);captureScreenEffects({});}
+  DrawPacket sprite() {
+    DrawPacket p;p.opcode=0x64;p.vertexCount=4;p.textured=true;
+    p.state.texturePage.raw=0x41f;p.state.clut.raw=0x7fbc;return p;
+  }
+};
+}
+
+TEST_F(MgsCinemaProducer, TheatreRequiresLiveProducerStateAndCompleteActorList) {
+  const auto before=ram;
+  captureScreenEffects(ram);auto view=capturedCinemaView();ASSERT_TRUE(view);
+  EXPECT_EQ(view->kind,MgsCinemaKind::Scripted);EXPECT_EQ(view->actor,demo&0x1fffff);
+  EXPECT_EQ(ram,before);
+  for(unsigned invalid=0;invalid<4;++invalid) {
+    ram=before;
+    if(invalid==0)word(0x800adb3c,0); // ordinary gameplay, including camera hints
+    if(invalid==1)word(demo+44,0xffffffff); // still loading
+    if(invalid==2)word(header+8,0);
+    if(invalid==3)word(demo+4,demo); // stale/cyclic actor allocation
+    captureScreenEffects(ram);EXPECT_FALSE(capturedCinemaView())<<invalid;
+  }
+  ram=before;actor(1,demo,"title.c");captureScreenEffects(ram);
+  EXPECT_FALSE(capturedCinemaView()); // STATE_DEMO/title meshes aren't a movie
+  actor(1,demo,"movie.c");word(demo+32,header);word(demo+52,320|(160u<<16));
+  captureScreenEffects(ram);view=capturedCinemaView();ASSERT_TRUE(view);
+  EXPECT_EQ(view->kind,MgsCinemaKind::Movie);
+  EXPECT_EQ(view->moviePicture,(NativeRect{0,24,320,160}));
+  word(demo+52,320|(224u<<16));captureScreenEffects(ram);
+  EXPECT_FALSE(capturedCinemaView()); // never guess a caption-free crop
+}
+
+TEST_F(MgsCinemaProducer, CaptionOwnershipRequiresResidentProducerAndEveryOriginalOutline) {
+  const auto before=ram;
+  captureScreenEffects(ram);
+  for(unsigned i=0;i<5;++i) {
+    auto p=sprite();bindScreenEffect(p,prims+4+i*20);
+    EXPECT_EQ(p.mgsSubtitleActor,menu&0x1fffff);
+    EXPECT_EQ(p.screenEffect.kind,MgsScreenEffectKind::None);
+  }
+  auto p=sprite();bindScreenEffect(p,prims+5);EXPECT_EQ(p.mgsSubtitleActor,0);
+  for(unsigned invalid=0;invalid<6;++invalid) {
+    ram=before;
+    if(invalid==0)word(0x8004b770,0); // foreign executable
+    if(invalid==1)word(jim,0x101); // pause/area label, not dialogue
+    if(invalid==2)word(prims+84,0x64010101); // broken outline group
+    if(invalid==3)word(menu+4,menu); // recycled menu allocation
+    if(invalid==4)word(arena,prims); // subtitles off/cleared: no live packets
+    if(invalid==5)word(jim+4,40|(103u<<16)); // pause baseline
+    captureScreenEffects(ram);p=sprite();bindScreenEffect(p,prims+4);
+    EXPECT_EQ(p.mgsSubtitleActor,0)<<invalid;
+  }
+  ram=before;word(jim,0x201);captureScreenEffects(ram);p=sprite();
+  bindScreenEffect(p,prims+4);EXPECT_NE(p.mgsSubtitleActor,0); // long native caption
+  captureScreenEffects({});p=sprite();bindScreenEffect(p,prims+4);
+  EXPECT_EQ(p.mgsSubtitleActor,0); // context/reset cannot retain old ownership
+}
+
+TEST_F(MgsCinemaProducer, CaptionBindingSurvivesActualGpuPacketRecorderOnBothPagesWithoutNativeChanges) {
+  const auto before=ram;
+  for(uint32_t page:{0u,320u}) {
+    gpu::GPU native,modern;
+    gpu::GPU::ReplayConfig cfg;cfg.enabled=true;cfg.internalScale=4;
+    modern.configureReplay(cfg);
+    for(auto *gpu:{&native,&modern}) {
+      for(uint32_t command:{0xe3000000u|page,0xe4000000u|(page+319)|(223u<<10),
+                            0xe5000000u|page})gpu->writeGP0(command);
+    }
+    configure(false,false);native.processLinkedList(prims+100,ram.data(),nullptr);
+    configure(true,false);modern.processLinkedList(prims+100,ram.data(),nullptr);
+    EXPECT_EQ(std::memcmp(native.getVRAM(),modern.getVRAM(),1024*512*sizeof(gpu::Color16)),0);
+    modern.snapshotDisplayBuffer(1);const auto frame=modern.tryConsumeReplay();ASSERT_TRUE(frame);
+    unsigned count=0;
+    for(const auto &op:frame->operations()) if(const auto *p=std::get_if<DrawPacket>(&op)) {
+      EXPECT_EQ(p->mgsSubtitleActor,menu&0x1fffff);
+      EXPECT_EQ(p->opcode,0x64);EXPECT_TRUE(p->textured);
+      EXPECT_EQ(p->vertices[1].u-p->vertices[0].u,256);
+      EXPECT_EQ(p->vertices[2].v-p->vertices[0].v,18);
+      EXPECT_GE(p->vertices[0].nativeX,int(page)+39);
+      ++count;
+    }
+    EXPECT_EQ(count,5);
+  }
+  EXPECT_EQ(ram,before);
+}
+
+TEST_F(MgsCinemaProducer, MovieDecoderUploadKeepsBandButNativeClearStillEndsRetention) {
+  actor(1,demo,"movie.c");word(demo+32,header);word(demo+52,320|(160u<<16));
+  gpu::GPU modern;gpu::GPU::ReplayConfig cfg;cfg.enabled=true;modern.configureReplay(cfg);
+  for(uint32_t command:{0x03000000u,0x05000000u,0x08000001u,
+      0x06000000u|608u|(3168u<<12),0x07000000u|16u|(240u<<10)})modern.writeGP1(command);
+  modern.processLinkedList(prims+100,ram.data(),nullptr);
+  modern.snapshotDisplayBuffer(100);const auto first=modern.tryConsumeReplay();ASSERT_TRUE(first);
+  ASSERT_TRUE(first->latch().mgsCinemaView);const auto movie=*first->latch().mgsCinemaView;
+  EXPECT_EQ(movie.kind,MgsCinemaKind::Movie);
+  gpu::DisplayScanoutPlan plan;plan.activeExtent={320,224};
+  const auto picture=[&] {return gpu::vr::CinemaPicture::capture({modern.getVRAM(),1024*512},plan);};
+  const auto before=picture();
+  // movie.c's DecDCT callback uploads sixteen-pixel strips at Y24 through
+  // LoadImage, independently of the menu ordering table.
+  for(uint32_t command:{0xa0000000u,24u<<16,16u|(160u<<16)})modern.writeGP0(command);
+  for(unsigned i=0;i<16*160/2;++i)modern.writeGP0(0x001f001f);
+  modern.snapshotDisplayBuffer(101);const auto uploaded=modern.tryConsumeReplay();ASSERT_TRUE(uploaded);
+  EXPECT_FALSE(uploaded->latch().mgsPresentationObserved);
+  EXPECT_FALSE(uploaded->latch().mgsCinemaView);
+  const auto after=picture();EXPECT_NE(after,before);EXPECT_TRUE(after.sameOutside(before,movie.moviePicture));
+  EXPECT_TRUE(gpu::vr::retainCinema(gpu::vr::MgsPresentation::Reuse,uploaded->latch(),movie,
+      after.sameOutside(before,movie.moviePicture),uploaded->operations()));
+  // A complete native clear can leave the already-black border unchanged.
+  // Its explicit operation must still invalidate cinema, even in that case.
+  for(uint32_t command:{0x02000000u,0u,320u|(224u<<16)})modern.writeGP0(command);
+  modern.snapshotDisplayBuffer(102);const auto cleared=modern.tryConsumeReplay();ASSERT_TRUE(cleared);
+  EXPECT_TRUE(picture().sameOutside(after,movie.moviePicture));
+  EXPECT_FALSE(gpu::vr::retainCinema(gpu::vr::MgsPresentation::Reuse,cleared->latch(),movie,
+      picture().sameOutside(after,movie.moviePicture),cleared->operations()));
 }

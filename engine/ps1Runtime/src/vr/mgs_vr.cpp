@@ -2,6 +2,7 @@
 
 #include "xr_vulkan.h"
 #include "scene_view.h"
+#include "cinema_view.h"
 #include "arm_ik.h"
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_profile.h"
@@ -32,6 +33,10 @@
 namespace ps1::gpu::vr {
 namespace {
 constexpr uint32_t maxFaces = 32768;
+constexpr uint32_t maxVertices = maxFaces * 6;
+constexpr uint32_t cinemaWindowVertices = 24, feedbackBaseVertices = 6, aimVertices = 18;
+// Packet admission leaves room for the complete window and diagnostic reticle.
+constexpr uint32_t packetVertexLimit = maxVertices - cinemaWindowVertices - feedbackBaseVertices - aimVertices;
 constexpr uint32_t vramWords = GPU::VRAM_WIDTH * GPU::VRAM_HEIGHT;
 constexpr float gameUnitsPerMetre = 1000;
 
@@ -40,6 +45,8 @@ struct Vertex {
   std::array<float, 2> uv;
   Vec3 shade;
   uint32_t material;
+  float perspective=1;
+  Vec3 feedbackPosition{};
 };
 
 struct alignas(16) Material {
@@ -66,7 +73,8 @@ struct Image {
 
 struct EyeTarget {
   VkExtent2D extent{};
-  Image color, depth;
+  Image color, depth, feedback;
+  VkFramebuffer feedbackFramebuffer=VK_NULL_HANDLE;
   std::vector<VkImageView> swapchainViews;
   std::vector<VkFramebuffer> framebuffers;
 };
@@ -385,10 +393,14 @@ struct Renderer::Impl {
   input::VrViewButton viewButton;
   std::unique_ptr<MgsAssetGpuCache> assets;
   std::array<EyeTarget, 2> targets;
-  VkRenderPass pass = VK_NULL_HANDLE;
+  VkRenderPass pass = VK_NULL_HANDLE, feedbackPass=VK_NULL_HANDLE;
+  VkSampler feedbackSampler=VK_NULL_HANDLE;
+  bool feedbackAvailable=true;
+  Image feedbackDummy;
   VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
   VkDescriptorPool pool = VK_NULL_HANDLE;
   VkDescriptorSet descriptor = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet,2> feedbackDescriptors{};
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
   VkPipeline worldPipeline = VK_NULL_HANDLE, translucentPipeline = VK_NULL_HANDLE,
              panelPipeline = VK_NULL_HANDLE;
@@ -404,6 +416,19 @@ struct Renderer::Impl {
   std::vector<Material> materials;
   // Headless-only provenance parallel to materials; points into retained frames.
   std::vector<const replay::DrawPacket *> materialSources;
+  replay::CrashReplayFramePtr cinemaFrame;
+  CinemaPageHistory cinemaPages;
+  std::optional<uint32_t> cinemaPage;
+  bool nativeWasCinema=false;
+  CinemaPicture cinemaPicture;
+  bool cinemaPictureUnchanged=false;
+  std::optional<CinemaView> cinemaCamera;
+  bool theatre=false;
+  CinemaWaterPass waterPass;
+  uint32_t feedbackBaseFrom=0;
+  float cinemaPictureHeight=CinemaView::height;
+  uint32_t captionPackets=0;
+  uint64_t lastCinema=0;
   std::vector<replay::DrawPacket> hudPaintPackets;
   uint64_t hudPaintCommands=0;
   std::vector<const replay::DrawPacket *> transparent;
@@ -457,6 +482,8 @@ struct Renderer::Impl {
     assets.reset();
     for (auto &eye : targets) {
       for (auto f : eye.framebuffers) vkDestroyFramebuffer(device(), f, nullptr);
+      vkDestroyFramebuffer(device(),eye.feedbackFramebuffer,nullptr);
+      destroyImage(eye.feedback);
       for (auto view : eye.swapchainViews) vkDestroyImageView(device(), view, nullptr);
       destroyImage(eye.color);
       destroyImage(eye.depth);
@@ -472,6 +499,9 @@ struct Renderer::Impl {
     vkDestroyDescriptorPool(device(), pool, nullptr);
     vkDestroyDescriptorSetLayout(device(), setLayout, nullptr);
     vkDestroyRenderPass(device(), pass, nullptr);
+    vkDestroyRenderPass(device(), feedbackPass, nullptr);
+    vkDestroySampler(device(),feedbackSampler,nullptr);
+    destroyImage(feedbackDummy);
     for (auto *b : {&nativeBuffer, &vertexBuffer, &materialBuffer, &readback}) {
       if (b->mapped) vkUnmapMemory(device(), b->memory);
       vkDestroyBuffer(device(), b->buffer, nullptr);
@@ -492,11 +522,11 @@ struct Renderer::Impl {
 
   void logPanelPlacement() {
     if (!panelLogReasons) return;
-    const Anchor active = worldFaces ? hudAnchor(eyes) : panelAnchor;
+    const Anchor active = worldFaces && !theatre ? hudAnchor(eyes) : panelAnchor;
     const auto head = recenter(eyes).origin;
     const auto forward = rotate(eyes[0].orientation, {0,0,-1});
     std::cout << "[MGS VR] Panel placement reason=" << panelLogReasons
-              << " mode=" << (worldFaces ? "hud" : "cinema")
+              << " mode=" << (worldFaces && !theatre ? "hud" : "cinema")
               << " head=" << head[0] << ',' << head[1] << ',' << head[2]
               << " forward=" << forward[0] << ',' << forward[1] << ',' << forward[2]
               << " anchor=" << active.origin[0] << ',' << active.origin[1] << ',' << active.origin[2]
@@ -595,19 +625,23 @@ struct Renderer::Impl {
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color;
     subpass.pDepthStencilAttachment = &depth;
-    VkSubpassDependency copy{0, VK_SUBPASS_EXTERNAL,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, 0};
+    // Keep dependencies identical: the world/panel pipelines are shared by
+    // both compatible passes. Only their colour attachment final layout differs.
+    const VkSubpassDependency colorReady{0, VK_SUBPASS_EXTERNAL,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, 0};
     VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     info.attachmentCount = attachments.size();
     info.pAttachments = attachments.data();
     info.subpassCount = 1;
     info.pSubpasses = &subpass;
-    if (offscreen()) {
-      info.dependencyCount = 1;
-      info.pDependencies = &copy;
-    }
+    info.dependencyCount = 1;
+    info.pDependencies = &colorReady;
     vkCheck(vkCreateRenderPass(device(), &info, nullptr, &pass), "Create VR render pass");
+    attachments[0].finalLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCheck(vkCreateRenderPass(device(),&info,nullptr,&feedbackPass),"Create cinema feedback pass");
 
     for (size_t i = 0; i < targets.size(); ++i) {
       auto &eye = targets[i];
@@ -627,6 +661,23 @@ struct Renderer::Impl {
       }
       createImage(eye.depth, eye.extent, depthFormat,
                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+      if(feedbackAvailable) try {
+        createImage(eye.feedback,eye.extent,xr.colorFormat,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+        const VkImageView feedbackAttachments[]{eye.feedback.view,eye.depth.view};
+        VkFramebufferCreateInfo feedbackInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        feedbackInfo.renderPass=feedbackPass;feedbackInfo.attachmentCount=2;feedbackInfo.pAttachments=feedbackAttachments;
+        feedbackInfo.width=eye.extent.width;feedbackInfo.height=eye.extent.height;feedbackInfo.layers=1;
+        vkCheck(vkCreateFramebuffer(device(),&feedbackInfo,nullptr,&eye.feedbackFramebuffer),"Create cinema feedback framebuffer");
+      } catch(const std::exception &error) {
+        for(auto &target:targets) {
+          vkDestroyFramebuffer(device(),target.feedbackFramebuffer,nullptr);target.feedbackFramebuffer=VK_NULL_HANDLE;
+          destroyImage(target.feedback);target.feedback={};
+        }
+        feedbackAvailable=false;
+        std::cerr<<"[MGS VR] Cinema feedback unavailable; keeping native water scenes: "<<error.what()<<'\n';
+      }
       for (auto view : views) {
         const VkImageView attachmentsForEye[]{view, eye.depth.view};
         VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -674,12 +725,14 @@ struct Renderer::Impl {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
         {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, shade)},
-        {3, 0, VK_FORMAT_R32_UINT, offsetof(Vertex, material)}
+        {3, 0, VK_FORMAT_R32_UINT, offsetof(Vertex, material)},
+        {4, 0, VK_FORMAT_R32_SFLOAT, offsetof(Vertex, perspective)},
+        {5, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, feedbackPosition)}
     };
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     input.vertexBindingDescriptionCount = 1;
     input.pVertexBindingDescriptions = &binding;
-    input.vertexAttributeDescriptionCount = 4;
+    input.vertexAttributeDescriptionCount = 6;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -767,35 +820,69 @@ struct Renderer::Impl {
     initTargets();
     createBuffer(nativeBuffer, vramWords * sizeof(Color16), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(nativeBuffer.mapped, 0, nativeBuffer.size);
-    createBuffer(vertexBuffer, maxFaces * 6 * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    createBuffer(vertexBuffer, maxVertices * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     createBuffer(materialBuffer, maxFaces * sizeof(Material), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     if (offscreen())
-      createBuffer(readback, captureSize * captureSize * 4u * 2u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+      createBuffer(readback, captureSize * captureSize * 4u * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
-    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
-    for (uint32_t i = 0; i < bindings.size(); ++i)
-      bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    // A valid black sampler is bound during ordinary/world rendering. It
+    // avoids both uninitialised descriptors and reading the feedback attachment
+    // while that same image is being written by the first pass.
+    createImage(feedbackDummy,{1,1},xr.colorFormat,VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter=sampler.minFilter=VK_FILTER_NEAREST;
+    sampler.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU=sampler.addressModeV=sampler.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCheck(vkCreateSampler(device(),&sampler,nullptr,&feedbackSampler),"Create cinema feedback sampler");
+    vkCheck(vkResetCommandBuffer(xr.commands,0),"Reset cinema sampler initialization");
+    const VkCommandBufferBeginInfo samplerBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkCheck(vkBeginCommandBuffer(xr.commands,&samplerBegin),"Begin cinema sampler initialization");
+    VkImageMemoryBarrier dummy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    dummy.srcQueueFamilyIndex=dummy.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+    dummy.image=feedbackDummy.image;dummy.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    dummy.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;dummy.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    dummy.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(xr.commands,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,
+                         0,nullptr,0,nullptr,1,&dummy);
+    const VkClearColorValue black{};
+    vkCmdClearColorImage(xr.commands,feedbackDummy.image,dummy.newLayout,&black,1,&dummy.subresourceRange);
+    dummy.oldLayout=dummy.newLayout;dummy.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    dummy.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;dummy.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(xr.commands,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,
+                         0,nullptr,0,nullptr,1,&dummy);
+    vkCheck(vkEndCommandBuffer(xr.commands),"End cinema sampler initialization");
+    VkSubmitInfo samplerSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};samplerSubmit.commandBufferCount=1;
+    samplerSubmit.pCommandBuffers=&xr.commands;
+    vkCheck(vkQueueSubmit(xr.queue,1,&samplerSubmit,VK_NULL_HANDLE),"Submit cinema sampler initialization");
+    vkCheck(vkQueueWaitIdle(xr.queue),"Wait cinema sampler initialization");
+    std::array<VkDescriptorSetLayoutBinding,4> bindings{};
+    for(uint32_t i=0;i<3;++i)
+      bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+    bindings[3]={3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
     const VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                                 nullptr, 0, uint32_t(bindings.size()), bindings.data()};
-    vkCheck(vkCreateDescriptorSetLayout(device(), &setInfo, nullptr, &setLayout), "Create VR descriptors");
-    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
-    const VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                             nullptr, 0, 1, 1, &poolSize};
-    vkCheck(vkCreateDescriptorPool(device(), &poolInfo, nullptr, &pool), "Create VR descriptor pool");
-    const VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                               nullptr, pool, 1, &setLayout};
-    vkCheck(vkAllocateDescriptorSets(device(), &allocate, &descriptor), "Allocate VR descriptor set");
+                                                 nullptr,0,uint32_t(bindings.size()),bindings.data()};
+    vkCheck(vkCreateDescriptorSetLayout(device(),&setInfo,nullptr,&setLayout),"Create VR descriptors");
+    const VkDescriptorPoolSize poolSizes[]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,9},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3}};
+    const VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,3,2,poolSizes};
+    vkCheck(vkCreateDescriptorPool(device(),&poolInfo,nullptr,&pool),"Create VR descriptor pool");
+    const VkDescriptorSetLayout layouts[]{setLayout,setLayout,setLayout};VkDescriptorSet sets[3]{};
+    const VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool,3,layouts};
+    vkCheck(vkAllocateDescriptorSets(device(),&allocate,sets),"Allocate VR descriptor sets");
+    descriptor=sets[0];feedbackDescriptors={sets[1],sets[2]};
     const VkDescriptorBufferInfo buffers[]{
-        {assets->buffer(), 0, assets->assets().bytes().size()},
-        {nativeBuffer.buffer, 0, nativeBuffer.size},
-        {materialBuffer.buffer, 0, materialBuffer.size}
-    };
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    for (uint32_t i = 0; i < writes.size(); ++i) {
-      writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptor, i, 0, 1,
-                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buffers[i], nullptr};
+        {assets->buffer(),0,assets->assets().bytes().size()},
+        {nativeBuffer.buffer,0,nativeBuffer.size},{materialBuffer.buffer,0,materialBuffer.size}};
+    for(unsigned set=0;set<3;++set) {
+      const VkDescriptorImageInfo imageInfo{feedbackSampler,set && feedbackAvailable?targets[set-1].feedback.view:feedbackDummy.view,
+                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+      std::array<VkWriteDescriptorSet,4> writes{};
+      for(unsigned i=0;i<3;++i)writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,sets[set],i,0,1,
+                                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&buffers[i],nullptr};
+      writes[3]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,sets[set],3,0,1,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&imageInfo,nullptr,nullptr};
+      vkUpdateDescriptorSets(device(),writes.size(),writes.data(),0,nullptr);
     }
-    vkUpdateDescriptorSets(device(), writes.size(), writes.data(), 0, nullptr);
     const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Matrix)};
     const VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                            nullptr, 0, 1, &setLayout, 1, &push};
@@ -822,10 +909,54 @@ struct Renderer::Impl {
               << " on " << properties.deviceName << '\n';
   }
 
-  bool addPacket(const replay::DrawPacket &packet, const DisplayAperture &aperture, bool world, bool eyeOverlay = false) {
+  bool addCinemaPacket(const replay::DrawPacket &packet) {
+    if(!cinemaCamera || !packet.originalMesh || packet.vertexCount>4 || !packet.indexCount ||
+        packet.indexCount>6 || materials.size()>=maxFaces-4 ||
+        vertices.size()>packetVertexLimit-12) return false;
+    // Two triangles clipped against one plane produce at most four triangles.
+    // Reserve that whole packet before adding its material or any vertices.
+    const uint32_t material=materials.size();
+    std::array<Vertex,4> points{};
+    for(unsigned i=0;i<packet.vertexCount;++i) {
+      auto &v=points[i];Vec3 world{};
+      if(!meshPosition(assets->assets().bytes(),*packet.originalMesh,i,world)) return false;
+      v.position=cinemaCamera->camera(world);
+      v.uv={float(packet.vertices[i].u),float(packet.vertices[i].v)};
+      v.shade=shadeVertex(packet,i);v.material=material;
+    }
+    for(unsigned i=0;i<packet.indexCount;++i) if(packet.triangleIndices[i]>=packet.vertexCount) return false;
+    materials.push_back(materialFor(packet));
+    if(offscreen()) materialSources.push_back(&packet);
+    const auto first=vertices.size();
+    for(unsigned triangle=0;triangle+2<packet.indexCount;triangle+=3) {
+      std::vector<Vertex> polygon;
+      for(unsigned j=0;j<3;++j) {
+        unsigned index=triangle+j;
+        if(packet.vertexCount==4 && packet.indexCount==6 && index>=4) index=9-index;
+        polygon.push_back(points[packet.triangleIndices[index]]);
+      }
+      polygon=CinemaView::clipNear(polygon);
+      for(auto &v:polygon) {
+        v.perspective=cinemaCamera->perspective(v.position[2]);
+        v.position=cinemaCamera->picture(v.position);
+      }
+      for(size_t i=1;i+1<polygon.size();++i) {
+        vertices.insert(vertices.end(),{polygon[0],polygon[i],polygon[i+1]});
+      }
+    }
+    return vertices.size()!=first;
+  }
+
+  bool addPacket(const replay::DrawPacket &packet, const DisplayAperture &aperture, bool world, bool eyeOverlay = false, bool caption = false) {
+    if(world && cinemaCamera) return addCinemaPacket(packet);
     if (materials.size() >= maxFaces - 4 || packet.vertexCount > 4 ||
         packet.indexCount == 0 || packet.indexCount > 6)
       return false;
+    // Each triangle clipped to four rectangle edges has at most seven points
+    // (five triangles). Admission is atomic, including clipped HUD/captions.
+    const uint32_t packetVertices = !world && !eyeOverlay ? 30 : packet.indexCount;
+    if(vertices.size()>packetVertexLimit-packetVertices) return false;
+    const bool water=cinemaCamera && waterPass.valid && packet.waterEffect[0]==waterPass.actor;
     const uint32_t material = materials.size();
     std::array<Vertex, 4> points{};
     for (unsigned i = 0; i < packet.vertexCount; ++i) {
@@ -835,8 +966,14 @@ struct Renderer::Impl {
         if (!meshPosition(assets->assets().bytes(), *packet.originalMesh, i, v.position))
           return false;
         v.position = playerCamera ? playerCamera->transform(v.position) : toybox.transform(v.position);
-      } else if (eyeOverlay) {
+      } else if(caption) {
+        v.position=CinemaView::caption(p.x,p.y,aperture.x,cinemaPictureHeight);
+      } else if (eyeOverlay && !theatre) {
         v.position = mgsEyeOverlayPosition(p.x, p.y, aperture.x, aperture.width, aperture.height);
+      } else if(eyeOverlay && theatre) {
+        v.position={float((p.x-aperture.x)/aperture.width-0.5)*CinemaView::width,
+            CinemaView::height/2-float(p.y/aperture.height)*(CinemaView::height+CinemaView::captionHeight),
+            -CinemaView::distance};
       } else {
         constexpr float panelDepth = 2.0f;
         v.position = {float((p.x - aperture.x) / aperture.width - 0.5) * 1.9f,
@@ -846,17 +983,19 @@ struct Renderer::Impl {
       v.uv = {float(p.u), float(p.v)};
       v.shade = shadeVertex(packet, i);
       v.material = material;
+      if(water)v.feedbackPosition=cinemaWaterSourcePosition(packet,i,aperture.x);
     }
     for (unsigned i = 0; i < packet.indexCount; ++i)
       if (packet.triangleIndices[i] >= packet.vertexCount) return false;
     materials.push_back(materialFor(packet));
+    if(water) materials.back().native[2]=4; // newly rendered eye, never final native VRAM
     if (offscreen()) materialSources.push_back(&packet);
     if (!world && !eyeOverlay) {
       const auto &area = packet.state.drawArea;
       const float left = std::max(0.0f, float(area.left) - aperture.x) / aperture.width * 1.9f - 0.95f;
       const float right = std::min(float(aperture.width), float(area.right + 1) - aperture.x) / aperture.width * 1.9f - 0.95f;
-      const float top = 0.534375f - std::max(0.0f, float(area.top) - aperture.y) / aperture.height * 1.06875f;
-      const float bottom = 0.534375f - std::min(float(aperture.height), float(area.bottom + 1) - aperture.y) / aperture.height * 1.06875f;
+      const float top = caption ? -cinemaPictureHeight/2 : 0.534375f - std::max(0.0f, float(area.top) - aperture.y) / aperture.height * 1.06875f;
+      const float bottom = caption ? -cinemaPictureHeight/2-CinemaView::captionHeight : 0.534375f - std::min(float(aperture.height), float(area.bottom + 1) - aperture.y) / aperture.height * 1.06875f;
       for (unsigned i = 0; i + 2 < packet.indexCount; i += 3) {
         std::vector<Vertex> polygon{points[packet.triangleIndices[i]], points[packet.triangleIndices[i+1]], points[packet.triangleIndices[i+2]]};
         const auto clip = [&](unsigned axis, float boundary, float sign) {
@@ -872,6 +1011,7 @@ struct Renderer::Impl {
               for (unsigned a = 0; a < 3; ++a) {
                 v.position[a] += (current.position[a]-previous.position[a])*t;
                 v.shade[a] += (current.shade[a]-previous.shade[a])*t;
+                v.feedbackPosition[a] += (current.feedbackPosition[a]-previous.feedbackPosition[a])*t;
               }
               for (unsigned a = 0; a < 2; ++a) v.uv[a] += (current.uv[a]-previous.uv[a])*t;
               clipped.push_back(v);
@@ -883,7 +1023,6 @@ struct Renderer::Impl {
         };
         clip(0, left, 1); clip(0, right, -1); clip(1, bottom, 1); clip(1, top, -1);
         for (size_t k = 1; k+1 < polygon.size(); ++k) {
-          if (vertices.size()+3 >= maxFaces*6-18) return false;
           vertices.insert(vertices.end(), {polygon[0], polygon[k], polygon[k+1]});
         }
       }
@@ -1045,19 +1184,54 @@ struct Renderer::Impl {
     Material material{};
     material.native = {0, 0, packed ? 3u : 2u, 255};
     material.data = {scanout.sourceByteX, scanout.sourceY, scanout.rowStep, 0};
-    const float x = packed ? 0 : float(scanout.sourceByteX / 2);
-    const float width = float(scanout.activeExtent.width);
-    const float height = float(scanout.activeExtent.height);
+    float x = packed ? 0 : float(scanout.sourceByteX / 2),y=0;
+    float width = float(scanout.activeExtent.width),height = float(scanout.activeExtent.height);
+    if(theatre && cinemaFrame && cinemaFrame->latch().mgsCinemaView->kind==replay::MgsCinemaKind::Movie) {
+      const auto &picture=cinemaFrame->latch().mgsCinemaView->moviePicture;
+      x+=picture.x;y=picture.y;width=picture.width;height=picture.height;
+    }
     materials.push_back(material);
+    if(offscreen())materialSources.push_back(nullptr);
     constexpr float halfWidth = 0.95f;
-    constexpr float halfHeight = halfWidth * 9 / 16;
+    const float halfHeight = theatre ? cinemaPictureHeight/2 : halfWidth*9/16;
     constexpr float depth = -2;
     const Vec3 white{1, 1, 1};
-    const Vertex a{{-halfWidth, halfHeight, depth}, {x, 0}, white, 0};
-    const Vertex b{{halfWidth, halfHeight, depth}, {x + width, 0}, white, 0};
-    const Vertex c{{-halfWidth, -halfHeight, depth}, {x, height}, white, 0};
-    const Vertex d{{halfWidth, -halfHeight, depth}, {x + width, height}, white, 0};
+    const Vertex a{{-halfWidth, halfHeight, depth}, {x, y}, white, 0};
+    const Vertex b{{halfWidth, halfHeight, depth}, {x + width, y}, white, 0};
+    const Vertex c{{-halfWidth, -halfHeight, depth}, {x, y + height}, white, 0};
+    const Vertex d{{halfWidth, -halfHeight, depth}, {x + width, y + height}, white, 0};
     vertices.insert(vertices.end(), {a, b, c, b, d, c});
+  }
+
+  bool cinemaWindow() {
+    if(vertices.size()>maxVertices-aimVertices-cinemaWindowVertices-feedbackBaseVertices || materials.size()>=maxFaces-1)
+      return false;
+    // These zero-disparity black borders clip the stereo scene to one fixed
+    // physical screen even when the viewer moves off-centre or rolls their head.
+    const uint32_t material=materials.size();Material black{};black.native[3]=255;
+    materials.push_back(black);
+    if(offscreen())materialSources.push_back(nullptr);
+    const auto rect=[&](float left,float right,float bottom,float top) {
+      const Vertex a{{left,top,-CinemaView::distance},{},{0,0,0},material};
+      const Vertex b{{right,top,-CinemaView::distance},{},{0,0,0},material};
+      const Vertex c{{left,bottom,-CinemaView::distance},{},{0,0,0},material};
+      const Vertex d{{right,bottom,-CinemaView::distance},{},{0,0,0},material};
+      vertices.insert(vertices.end(),{a,b,c,b,d,c});
+    };
+    rect(-100,-CinemaView::width/2,-100,100);rect(CinemaView::width/2,100,-100,100);
+    rect(-CinemaView::width/2,CinemaView::width/2,cinemaPictureHeight/2,100);
+    rect(-CinemaView::width/2,CinemaView::width/2,-100,-cinemaPictureHeight/2);
+    return true;
+  }
+
+  bool addFeedbackBase() {
+    if(vertices.size()>maxVertices-aimVertices-feedbackBaseVertices || materials.size()>=maxFaces-1) return false;
+    feedbackBaseFrom=vertices.size();const uint32_t material=materials.size();
+    Material copy{};copy.native={0,0,5,255};materials.push_back(copy);
+    if(offscreen())materialSources.push_back(nullptr);
+    const Vertex a{{-1,-1,0},{0,0},{1,1,1},material},b{{1,-1,0},{1,0},{1,1,1},material},
+        c{{-1,1,0},{0,1},{1,1,1},material},d{{1,1,0},{1,1},{1,1,1},material};
+    vertices.insert(vertices.end(),{a,b,c,b,d,c});return true;
   }
 
   void updateScene() {
@@ -1071,18 +1245,52 @@ struct Renderer::Impl {
     if (builtFrame == display.latchFrame) return;
     builtFrame = display.latchFrame;
     const auto presentation = frame
-        ? mgsPresentation(frame->operations(), frame->latch().mgsPlayerView)
+        ? mgsPresentation(frame->operations(), frame->latch().mgsPlayerView, frame->latch().mgsCinemaView)
         : MgsPresentation::Reuse;
     const auto aperture = deriveDisplayAperture(display, DisplayAreaPolicy::Programmed);
     const bool pausedWorld=frame && worldFrame && frame->latch().mgsPlayerView &&
         frame->latch().mgsPlayerView->paused && worldFrame->latch().mgsPlayerView &&
         frame->latch().mgsPlayerView->sceneEpoch==worldFrame->latch().mgsPlayerView->sceneEpoch &&
         frame->latch().mgsPlayerView->bodyLifetime==worldFrame->latch().mgsPlayerView->bodyLifetime;
-    if (presentation == MgsPresentation::Cinema || !aperture.enabled ||
+    const bool newTheatre=presentation==MgsPresentation::StereoCinema || presentation==MgsPresentation::MovieCinema;
+    const bool sameTheatre=frame && cinemaFrame && frame->latch().mgsCinemaView &&
+        frame->latch().mgsCinemaView->actor==cinemaFrame->latch().mgsCinemaView->actor &&
+        frame->latch().mgsCinemaView->kind==cinemaFrame->latch().mgsCinemaView->kind;
+    const auto scanout=deriveDisplayScanoutPlan(rawDisplayCrtcInput(display),DisplayAreaPolicy::Programmed);
+    CinemaPicture picture;
+    if(cinemaFrame || newTheatre) picture=CinemaPicture::capture(vram,scanout);
+    cinemaPictureUnchanged=cinemaFrame && !picture.pixels.empty() && picture==cinemaPicture;
+    const bool wasMovie=cinemaFrame && cinemaFrame->latch().mgsCinemaView->kind==replay::MgsCinemaKind::Movie;
+    const bool movieUpload=wasMovie && picture.sameOutside(cinemaPicture,cinemaFrame->latch().mgsCinemaView->moviePicture);
+    cinemaPages.observe(frame,presentation,vram,scanout);
+    const auto *selectedPage=cinemaPages.displayed(vram,scanout);
+    cinemaPage.reset();
+    if(presentation==MgsPresentation::MovieCinema || (wasMovie && !newTheatre)) {
+      // Movies upload the displayed native picture directly. Their original
+      // outside-picture retention policy is independent of scripted draw pages.
+      if(!newTheatre && (!frame || !aperture.enabled || builtFrame<lastCinema ||
+          !retainCinema(presentation,frame->latch(),*cinemaFrame->latch().mgsCinemaView,
+                        cinemaPictureUnchanged || movieUpload,frame->operations()))) cinemaFrame.reset();
+      if(newTheatre)cinemaFrame=frame;
+    } else {
+      cinemaFrame=selectedPage?selectedPage->scene:nullptr;
+      if(selectedPage)cinemaPage=scanout.sourceByteX/2;
+    }
+    if(selectedPage && cinemaPage) {
+      picture=selectedPage->picture;
+      std::memcpy(nativeBuffer.mapped,selectedPage->nativeVram.data(),nativeBuffer.size);
+      nativeWasCinema=true;
+    } else if(nativeWasCinema) {
+      std::memcpy(nativeBuffer.mapped,vram.data(),nativeBuffer.size);nativeWasCinema=false;
+    }
+    if(cinemaFrame) {cinemaPicture=std::move(picture);lastCinema=builtFrame;}
+    else cinemaPicture={};
+    if (presentation == MgsPresentation::Cinema || newTheatre || !aperture.enabled ||
         builtFrame < lastWorld || (!pausedWorld && builtFrame - lastWorld > 6))
       worldFrame.reset();
-    if (frame && mgsHasPanelContent(frame->operations(),aperture.width,aperture.height))
+    if (frame && (sameTheatre || newTheatre || mgsHasPanelContent(frame->operations(),aperture.width,aperture.height)))
       panelFrame = frame;
+    if(selectedPage && cinemaPage)panelFrame=selectedPage->panel;
     if (presentation == MgsPresentation::Gameplay) {
       worldFrame = frame;
       lastWorld = builtFrame;
@@ -1096,8 +1304,32 @@ struct Renderer::Impl {
     materialSources.clear();
     hudPaintPackets.clear();hudPaintCommands=0;
     transparent.clear();
-    playerCamera.reset();
+    playerCamera.reset();cinemaCamera.reset();captionPackets=0;waterPass={};feedbackBaseFrom=0;
+    theatre=bool(cinemaFrame);cinemaPictureHeight=CinemaView::height;
+    if(theatre) {
+      const auto &view=*cinemaFrame->latch().mgsCinemaView;
+      if(view.kind==replay::MgsCinemaKind::Scripted) {
+        cinemaCamera=CinemaView{view};waterPass=cinemaWaterPass(cinemaFrame->operations());
+        // Unsupported ownership/order must keep the complete native picture.
+        if(waterPass.actor && (!waterPass.valid || !feedbackAvailable)) {theatre=false;cinemaCamera.reset();waterPass={};}
+      }
+      else cinemaPictureHeight=CinemaView::height*view.moviePicture.height/224;
+    }
     worldFaces = solidVertices = worldVertices = bodyFaces = 0;
+    if(cinemaCamera && aperture.enabled) {
+      const auto operations=cinemaFrame->operations();
+      for(size_t i=waterPass.valid?waterPass.sceneBegin:0;i<operations.size();++i)
+        if(const auto *packet=std::get_if<replay::DrawPacket>(&operations[i]);
+            packet && isSourceWorldFace(*packet) &&
+            packet->originalMesh->temporalIdentity[0]==cinemaCamera->source.sceneEpoch) {
+          if(packet->state.blend.enabled) transparent.push_back(packet);
+          else if(addCinemaPacket(*packet)) ++worldFaces;
+        }
+      solidVertices=vertices.size();
+      for(auto *packet:transparent) if(addCinemaPacket(*packet)) ++worldFaces;
+      worldVertices=vertices.size();
+      if(!worldFaces) { theatre=false;cinemaCamera.reset();waterPass={}; }
+    }
     if (worldFrame && aperture.enabled) {
       const auto &player = worldFrame->latch().mgsPlayerView;
       const auto isWorld = [&](const replay::DrawPacket &p) {
@@ -1165,13 +1397,37 @@ struct Renderer::Impl {
     }
     if (worldFaces == 0) {
       vertices.clear();
-      materials.clear();
+      materials.clear();materialSources.clear();
       cinema();
     }
-    if (panelFrame && worldFaces) {
+    if(theatre && !cinemaWindow()) {
+      // Never submit an unmasked or partial theatre if a future path consumes
+      // its reserve. The complete native panel remains a bounded fallback.
+      vertices.clear();materials.clear();materialSources.clear();eyeOverlays.clear();
+      worldFaces=solidVertices=worldVertices=bodyFaces=0;
+      theatre=false;cinemaCamera.reset();waterPass={};feedbackBaseFrom=0;cinema();
+    }
+    uint32_t waterSubmitted=0;
+    if (panelFrame && (worldFaces || theatre)) {
       std::optional<uint32_t> enclosingPage;
-      hudPaintPackets.reserve(panelFrame->operations().size());
-      for (const auto &op : panelFrame->operations()) {
+      std::vector<const replay::Operation *> hudOperations;
+      if(waterPass.valid) {
+        const auto source=cinemaFrame->operations();
+        for(size_t i=waterPass.sceneBegin;i<source.size();++i) {
+          const auto *packet=std::get_if<replay::DrawPacket>(&source[i]);
+          if(panelFrame==cinemaFrame || i<waterPass.firstStrip || (packet && packet->waterEffect[0]==waterPass.actor))
+            hudOperations.push_back(&source[i]);
+        }
+      }
+      if(!waterPass.valid || panelFrame!=cinemaFrame)
+        for(const auto &op:panelFrame->operations()) {
+          const auto *packet=std::get_if<replay::DrawPacket>(&op);
+          if(waterPass.valid && packet && (packet->waterEffect[0] || packet->mgsWaterClearActor)) continue;
+          hudOperations.push_back(&op);
+        }
+      hudPaintPackets.reserve(hudOperations.size());
+      for (const auto *operation : hudOperations) {
+        const auto &op=*operation;
         const auto *packet = std::get_if<replay::DrawPacket>(&op);
         if(const auto *paint=std::get_if<replay::PaintRect>(&op)) {
           if(auto lowered=mgsHudPaintRect(*paint,aperture.width,aperture.height)) {
@@ -1180,6 +1436,10 @@ struct Renderer::Impl {
           }
         }
         if (!packet) continue;
+        if(waterPass.valid && packet->waterEffect[0]==waterPass.actor && !feedbackBaseFrom)
+          if(!addFeedbackBase()) break;
+        const bool caption=theatre && packet->mgsSubtitleActor;
+        if(theatre && !cinemaCamera && !caption) continue;
         const auto pageX = mgsHudPage(packet->state.drawArea, enclosingPage);
         if (pageX) enclosingPage = pageX;
         // Polygons used for UI often retain the generic Projected3D route,
@@ -1193,7 +1453,7 @@ struct Renderer::Impl {
         // Keep the retained horizontal DRAW page, independently of the
         // latched DISPLAY page. Radar's drawOffset is its local centre, not
         // the framebuffer origin, so subtracting it would move the radar.
-        if (!pageX) continue;
+        if (!pageX || (cinemaPage && pageX!=cinemaPage)) continue;
         DisplayAperture page = aperture;
         page.x = *pageX;
         page.y = 0;
@@ -1202,13 +1462,23 @@ struct Renderer::Impl {
         if (isMgsHudBackground(*packet, page.x, page.width, page.height)) continue;
         const bool eyeOverlay = isMgsEyeOverlay(*packet, page.x, page.width, page.height);
         const uint32_t from = vertices.size();
-        if (addPacket(*packet, page, false, eyeOverlay) && eyeOverlay)
-          eyeOverlays.push_back({from, uint32_t(vertices.size()), packet->state.blend.mode});
+        if(addPacket(*packet,page,false,eyeOverlay,caption)) {
+          if(waterPass.valid && packet->waterEffect[0]==waterPass.actor) ++waterSubmitted;
+          if(caption) ++captionPackets;
+          if(eyeOverlay)eyeOverlays.push_back({from,uint32_t(vertices.size()),packet->state.blend.mode});
+        }
       }
     }
-    if (panelWasWorld != (worldFaces != 0)) {
+    if(waterPass.valid && (!feedbackBaseFrom || waterSubmitted!=waterPass.strips)) {
+      // A clipped/capacity-limited feedback pass must never expose an unfiltered
+      // fragment of the scene. Keep the complete native picture instead.
+      vertices.clear();materials.clear();materialSources.clear();eyeOverlays.clear();
+      worldFaces=solidVertices=worldVertices=bodyFaces=0;
+      theatre=false;cinemaCamera.reset();waterPass={};feedbackBaseFrom=captionPackets=0;cinema();
+    }
+    if (panelWasWorld != (worldFaces != 0 && !theatre)) {
       panelAnchor = recenter(eyes);
-      panelWasWorld = worldFaces != 0;
+      panelWasWorld = worldFaces != 0 && !theatre;
       panelLogReasons |= 2;
     }
     if (!vertices.empty())
@@ -1268,6 +1538,7 @@ struct Renderer::Impl {
       out << '\n';
     }
     for (size_t material = 0; material < materialSources.size(); ++material) {
+      if(!materialSources[material])continue;
       const auto &packet = *materialSources[material];
       if (!isSourceWorldFace(packet)) continue;
       const auto &mesh = *packet.originalMesh;
@@ -1287,9 +1558,9 @@ struct Renderer::Impl {
   }
 
   void drawEyes(const std::array<EyeView, 2> &views, bool readPixels = true) {
-    const Anchor overlayAnchor = worldFaces ? hudAnchor(views) : panelAnchor;
+    const Anchor overlayAnchor = worldFaces && !theatre ? hudAnchor(views) : panelAnchor;
     const bool showAim = false; // Native weapons; no hand-driven aiming beam.
-    std::array<Vertex, 18> reticle{};
+    std::array<Vertex, aimVertices> reticle{};
     if (showAim) {
       const auto &q = pad.aimPose.orientation;
       const auto &p = pad.aimPose.position;
@@ -1346,54 +1617,66 @@ struct Renderer::Impl {
       std::array<VkClearValue, 2> clear{};
       clear[0].color.float32[3] = 1;
       clear[1].depthStencil.depth = 1;
-      VkRenderPassBeginInfo passBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-      passBegin.renderPass = pass;
-      passBegin.framebuffer = target.framebuffers.at(image[i]);
-      passBegin.renderArea.extent = target.extent;
-      passBegin.clearValueCount = clear.size();
-      passBegin.pClearValues = clear.data();
-      vkCmdBeginRenderPass(xr.commands, &passBegin, VK_SUBPASS_CONTENTS_INLINE);
-      const VkViewport viewport{0, 0, float(target.extent.width), float(target.extent.height), 0, 1};
-      const VkRect2D scissor{{0, 0}, target.extent};
-      vkCmdSetViewport(xr.commands, 0, 1, &viewport);
-      vkCmdSetScissor(xr.commands, 0, 1, &scissor);
-      vkCmdBindDescriptorSets(xr.commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              pipelineLayout, 0, 1, &descriptor, 0, nullptr);
-      const VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(xr.commands, 0, 1, &vertexBuffer.buffer, &offset);
-      Anchor renderAnchor = playerCamera ? anchor : toyboxAnchor;
-      if (playerCamera)
-        renderAnchor.heading = yaw(2 * std::atan2(anchor.heading[1], anchor.heading[3]) + stickTurn);
-      const auto matrix = eyeMatrix(renderAnchor, views[i]);
-      vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                         0, sizeof(matrix), matrix.data());
-      const auto draw = [&](VkPipeline pipeline, uint32_t from, uint32_t to) {
-        if (from == to) return;
-        vkCmdBindPipeline(xr.commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        vkCmdDraw(xr.commands, to - from, 1, from, 0);
+      const VkViewport viewport{0,0,float(target.extent.width),float(target.extent.height),0,1};
+      const VkRect2D scissor{{0,0},target.extent};
+      const VkDeviceSize offset=0;
+      const auto begin=[&](VkRenderPass renderPass,VkFramebuffer framebuffer,VkDescriptorSet set) {
+        VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        info.renderPass=renderPass;info.framebuffer=framebuffer;info.renderArea.extent=target.extent;
+        info.clearValueCount=clear.size();info.pClearValues=clear.data();
+        vkCmdBeginRenderPass(xr.commands,&info,VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdSetViewport(xr.commands,0,1,&viewport);vkCmdSetScissor(xr.commands,0,1,&scissor);
+        vkCmdBindDescriptorSets(xr.commands,VK_PIPELINE_BIND_POINT_GRAPHICS,pipelineLayout,0,1,&set,0,nullptr);
+        vkCmdBindVertexBuffers(xr.commands,0,1,&vertexBuffer.buffer,&offset);
       };
-      draw(worldPipeline, 0, solidVertices);
-      draw(translucentPipeline, solidVertices, worldVertices);
-      const auto panelMatrix = eyeMatrix(overlayAnchor, views[i]);
-      vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                         0, sizeof(panelMatrix), panelMatrix.data());
-      uint32_t panelFrom = worldVertices;
-      const Matrix clipMatrix{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-      for (const auto &overlay : eyeOverlays) {
-        draw(panelPipeline, panelFrom, overlay.from);
-        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                           0, sizeof(clipMatrix), clipMatrix.data());
-        draw(eyeOverlayPipelines[size_t(overlay.mode)], overlay.from, overlay.to);
-        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                           0, sizeof(panelMatrix), panelMatrix.data());
-        panelFrom = overlay.to;
+      const auto push=[&](const Matrix &m) {
+        vkCmdPushConstants(xr.commands,pipelineLayout,VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(m),m.data());
+      };
+      const auto draw=[&](VkPipeline pipeline,uint32_t from,uint32_t to) {
+        if(from==to)return;
+        vkCmdBindPipeline(xr.commands,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+        vkCmdDraw(xr.commands,to-from,1,from,0);
+      };
+      Anchor renderAnchor=theatre?panelAnchor:playerCamera?anchor:toyboxAnchor;
+      if(playerCamera)renderAnchor.heading=yaw(2*std::atan2(anchor.heading[1],anchor.heading[3])+stickTurn);
+      const auto matrix=eyeMatrix(renderAnchor,views[i]);
+      const auto panelMatrix=eyeMatrix(overlayAnchor,views[i]);
+      const Matrix clipMatrix{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+      const auto panels=[&](uint32_t from,uint32_t to) {
+        push(panelMatrix);
+        for(const auto &overlay:eyeOverlays) {
+          if(overlay.to<=from || overlay.from>=to)continue;
+          draw(panelPipeline,from,overlay.from);
+          push(theatre?panelMatrix:clipMatrix);
+          draw(eyeOverlayPipelines[size_t(overlay.mode)],overlay.from,overlay.to);
+          push(panelMatrix);from=overlay.to;
+        }
+        draw(panelPipeline,from,to);
+      };
+      if(feedbackBaseFrom) {
+        begin(feedbackPass,target.feedbackFramebuffer,descriptor);
+        push(matrix);draw(worldPipeline,0,solidVertices);draw(translucentPipeline,solidVertices,worldVertices);
+        panels(worldVertices,feedbackBaseFrom);
+        vkCmdEndRenderPass(xr.commands);
+        // The render pass transitions colour to shader-read. Also order the
+        // shared depth attachment before the final pass clears it again.
+        const VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+        vkCmdPipelineBarrier(xr.commands,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,0,1,&ready,0,nullptr,0,nullptr);
       }
-      draw(panelPipeline, panelFrom, vertices.size());
-      if (showAim) {
-        const auto pointerMatrix = eyeMatrix(Anchor{}, views[i]);
-        vkCmdPushConstants(xr.commands, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                           0, sizeof(pointerMatrix), pointerMatrix.data());
-        draw(panelPipeline, vertices.size(), vertices.size() + reticle.size());
+      begin(pass,target.framebuffers.at(image[i]),feedbackBaseFrom?feedbackDescriptors[i]:descriptor);
+      if(feedbackBaseFrom) {
+        push(clipMatrix);draw(panelPipeline,feedbackBaseFrom,feedbackBaseFrom+feedbackBaseVertices);
+        panels(feedbackBaseFrom+feedbackBaseVertices,vertices.size());
+      } else {
+        push(matrix);draw(worldPipeline,0,solidVertices);draw(translucentPipeline,solidVertices,worldVertices);
+        panels(worldVertices,vertices.size());
+      }
+      if(showAim) {
+        push(eyeMatrix(Anchor{},views[i]));
+        draw(panelPipeline,vertices.size(),vertices.size()+reticle.size());
       }
       vkCmdEndRenderPass(xr.commands);
       if (offscreen() && readPixels) {
@@ -1403,6 +1686,21 @@ struct Renderer::Impl {
         copy.imageExtent = {captureSize, captureSize, 1};
         vkCmdCopyImageToBuffer(xr.commands, target.color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                readback.buffer, 1, &copy);
+        if(feedbackBaseFrom) {
+          VkImageMemoryBarrier read{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+          read.srcQueueFamilyIndex=read.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+          read.image=target.feedback.image;read.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+          read.oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;read.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+          read.srcAccessMask=VK_ACCESS_SHADER_READ_BIT;read.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+          vkCmdPipelineBarrier(xr.commands,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,
+                               0,nullptr,0,nullptr,1,&read);
+          copy.bufferOffset=(i+2)*captureSize*captureSize*4u;
+          vkCmdCopyImageToBuffer(xr.commands,target.feedback.image,read.newLayout,readback.buffer,1,&copy);
+          read.oldLayout=read.newLayout;read.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          read.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;read.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+          vkCmdPipelineBarrier(xr.commands,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,
+                               0,nullptr,0,nullptr,1,&read);
+        }
       }
     }
     if (offscreen() && readPixels) {
@@ -1426,14 +1724,14 @@ struct Renderer::Impl {
     if (!offscreen()) for (size_t i = 0; i < image.size(); ++i) xr.release(i);
   }
 
-  void dump(const char *pose) {
+  void dump(const char *pose,unsigned eyeOffset=0) {
     const auto *bytes = static_cast<const uint8_t *>(readback.mapped);
     for (size_t i = 0; i < 2; ++i) {
       std::ofstream file(directory / (std::string(pose) + (i ? "-right.ppm" : "-left.ppm")),
                          std::ios::binary);
       file << "P6\n" << captureSize << ' ' << captureSize << "\n255\n";
       for (uint32_t j = 0; j < captureSize * captureSize; ++j)
-        file.write(reinterpret_cast<const char *>(bytes + (i * captureSize * captureSize + j) * 4), 3);
+        file.write(reinterpret_cast<const char *>(bytes + ((i+eyeOffset) * captureSize * captureSize + j) * 4), 3);
       if (!file) throw std::runtime_error("Could not write MGS eye capture");
     }
   }
@@ -1482,7 +1780,7 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
         // without changing Snake's native root, weapon or bullet matrix.
       }
     }
-    if (!state.firstPerson && state.worldFaces && state.worldFrame &&
+    if (!state.firstPerson && !state.theatre && state.worldFaces && state.worldFrame &&
         !(state.panelFrame && state.panelFrame->latch().mgsPlayerView && state.panelFrame->latch().mgsPlayerView->paused)) {
       const char *x=std::getenv("PS1_VR_HEADLESS_MOVE_X"),*y=std::getenv("PS1_VR_HEADLESS_MOVE_Y");
       if(x || y) {
@@ -1577,7 +1875,7 @@ bool Renderer::beginFrame(input::VrInputSample &sample) {
     sample.y = stick[1];
     sample.facing = uint16_t(int32_t(std::lround(heading *
         (4096 / (2 * std::numbers::pi_v<float>)))) & 4095);
-  } else if (focused && !pausedView && state.worldFaces && state.worldFrame && state.toybox.placed) {
+  } else if (focused && !pausedView && !state.theatre && state.worldFaces && state.worldFrame && state.toybox.placed) {
     // The stage stays fixed while native padOrigin follows room camera cuts.
     // Compensate only the pad direction; native Snake decides how to turn/run.
     const auto &player=*state.worldFrame->latch().mgsPlayerView;
@@ -1608,13 +1906,14 @@ void Renderer::present() {
       return;
     }
     if (state.captured || state.vertices.empty() || state.builtFrame < state.captureAt ||
-        (state.firstPerson && state.worldFaces && !state.playerCamera))
+        (state.firstPerson && !state.theatre && state.worldFaces && !state.playerCamera))
       return;
     std::array<EyeView, 2> coincident{};
     state.drawEyes(coincident);
     state.dump("coincident");
     state.drawEyes(state.eyes);
     state.dump("forward");
+    if(state.feedbackBaseFrom)state.dump("forward-scene",2);
     state.drawEyes(diagnosticEyes(std::numbers::pi_v<float> / 2));
     state.dump("yaw90");
     state.drawEyes(diagnosticEyes(std::numbers::pi_v<float>));
@@ -1652,6 +1951,16 @@ void Renderer::present() {
          << " toybox_centre=" << state.toybox.centre[0] << ',' << state.toybox.centre[1] << ',' << state.toybox.centre[2]
          << " vertices=" << state.vertices.size() << " panel_vertices=" << state.vertices.size()-state.worldVertices
          << " panorama_rejected=" << state.panoramaRejected << " eye_overlays=" << state.eyeOverlays.size()
+         << " panel_cinema_actor=" << (state.panelFrame && state.panelFrame->latch().mgsCinemaView ? state.panelFrame->latch().mgsCinemaView->actor : 0)
+         << " panel_cinema_projection=" << (state.panelFrame && state.panelFrame->latch().mgsCinemaView ? state.panelFrame->latch().mgsCinemaView->projection : 0)
+         << " cinema_native_same=" << state.cinemaPictureUnchanged
+         << " cinema=" << state.theatre << " cinema_faces=" << (state.theatre?state.worldFaces:0)
+         << " cinema_actor=" << (state.cinemaFrame?state.cinemaFrame->latch().mgsCinemaView->actor:0)
+         << " cinema_display_page=" << (state.cinemaPage?int(*state.cinemaPage):-1)
+         << " cinema_page_history=" << (bool(state.cinemaPages.pages[0].scene) | (bool(state.cinemaPages.pages[1].scene)<<1))
+         << " water_actor=" << state.waterPass.actor << " water_strips=" << state.waterPass.strips
+         << " water_feedback=" << bool(state.feedbackBaseFrom) << " water_supported=" << state.feedbackAvailable
+         << " caption_packets=" << state.captionPackets
          << " hud_paint_commands=" << state.hudPaintCommands << " toybox_heading=" << state.toybox.heading
          << " source=" << scanout.sourceByteX << ',' << scanout.sourceY
          << " extent=" << scanout.activeExtent.width << ',' << scanout.activeExtent.height
@@ -1682,6 +1991,9 @@ void Renderer::present() {
            << " hud_candidate=" << isMgsHudCandidate(*packet)
            << " semantic=" << unsigned(packet->semanticReason) << " fallback=" << unsigned(packet->fallbackReason)
            << " surface=" << unsigned(packet->surfaceEffect.kind) << ',' << packet->surfaceEffect.actor
+           << " water=" << packet->waterEffect[0] << ',' << packet->waterEffect[1]
+           << " water_clear_actor=" << packet->mgsWaterClearActor
+           << " subtitle_actor=" << packet->mgsSubtitleActor
            << " screen=" << unsigned(packet->screenEffect.kind) << ',' << packet->screenEffect.actor
            << " gouraud=" << packet->gouraud << " raw_texture=" << packet->rawTexture
            << " mask=" << packet->state.mask.forceMaskBit << ',' << packet->state.mask.checkMaskBit
@@ -1726,6 +2038,8 @@ void Renderer::present() {
 void Renderer::rebase() {
   impl_->worldFrame.reset();
   impl_->panelFrame.reset();
+  impl_->cinemaFrame.reset();impl_->cinemaPages.reset();impl_->cinemaPage.reset();
+  impl_->cinemaPicture={};impl_->lastCinema=0;impl_->nativeWasCinema=false;
   impl_->builtFrame = impl_->revision = UINT64_MAX;
   impl_->lastWorld = 0;
   impl_->toybox.placed = false;

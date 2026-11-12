@@ -40,10 +40,11 @@ inline bool isSourceWorldFace(const replay::DrawPacket &packet) {
          packet.route == replay::PacketRoute::Projected3D;
 }
 
-enum class MgsPresentation { Reuse, Gameplay, Cinema };
+enum class MgsPresentation { Reuse, Gameplay, Cinema, StereoCinema, MovieCinema };
 inline MgsPresentation mgsPresentation(std::span<const replay::Operation> operations,
-                                       const std::optional<replay::MgsPlayerView> &player) {
-  bool source = false, gameplay = false;
+                                       const std::optional<replay::MgsPlayerView> &player,
+                                       const std::optional<replay::MgsCinemaView> &cinema = {}) {
+  bool source = false, gameplay = false, scripted=false;
   for (const auto &op : operations) {
     const auto *packet = std::get_if<replay::DrawPacket>(&op);
     if (!packet) continue;
@@ -51,11 +52,18 @@ inline MgsPresentation mgsPresentation(std::span<const replay::Operation> operat
       return MgsPresentation::Cinema;
     if (!isSourceWorldFace(*packet)) continue;
     source = true;
+    scripted |= cinema && cinema->actor && cinema->kind==replay::MgsCinemaKind::Scripted &&
+        cinema->projection>0 && packet->originalMesh->temporalIdentity[0]==cinema->sceneEpoch;
     // Source geometry also exists in title/menu scenes. The producer's
     // authenticated live Snake/body witness distinguishes playable world
     // snapshots and already rejects authored views and scripts. Native pause
     // and selectors retain this witness and their original overlay packets.
     gameplay |= player && packet->originalMesh->temporalIdentity[0] == player->sceneEpoch;
+  }
+  if(cinema && cinema->actor) {
+    if(cinema->kind==replay::MgsCinemaKind::Movie) return MgsPresentation::MovieCinema;
+    if(scripted) return MgsPresentation::StereoCinema;
+    if(!source) return MgsPresentation::Reuse;
   }
   if (gameplay) return MgsPresentation::Gameplay;
   // An explicit non-gameplay scene replaces the world immediately. Empty

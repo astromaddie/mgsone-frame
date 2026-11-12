@@ -1,5 +1,6 @@
 #include "runtime/cpu_context.h"
 #include "../../ps1Runtime/src/vr/scene_view.h"
+#include "../../ps1Runtime/src/vr/cinema_view.h"
 #include "runtime/games/mgs_asset_cache.h"
 #include "runtime/games/mgs_mesh_replay.h"
 #include "runtime/games/mgs_profile.h"
@@ -2238,4 +2239,228 @@ TEST_F(MgsSourceMeshTest, StageLightingRequiresMapOwnershipAndReloadsSources) {
   second = recover();
   ASSERT_TRUE(second);
   EXPECT_EQ(second->buckets[39][0].originalMesh->lighting.ambient[3], 0);
+}
+
+TEST_F(MgsSourceMeshTest, ScriptedCinemaLatchesAuthenticatedProducerWithItsActualSceneCamera) {
+  struct Stereo {Stereo(){setMeshReplayStereo(true);}~Stereo(){setMeshReplayStereo(false);}} stereo;
+  // Actual d00a capture: live DEMO at native frame402/1981, STREAM pause8.
+  constexpr uint32_t actor=0x8015c3d8,header=0x8015c6d8,head=0x800af390+68;
+  memory.write32(head+4,actor);memory.write32(actor,head);memory.write32(actor+4,head+32);
+  memory.write32(head+32,actor);memory.write32(actor+8,0x8007c024);memory.write32(actor+20,actor+0x200);
+  for(unsigned i=0;i<sizeof("demothrd.c");++i)memory.write8(actor+0x200+i,"demothrd.c"[i]);
+  memory.write32(actor+44,402);memory.write32(actor+48,header);memory.write32(header+8,1981);
+  memory.write32(0x800adb3c,0x80000020);memory.write32(0x800ae0a0,8);
+  link();gpu::GPU modern;configureGpu(modern,true);
+  for(uint32_t command:{0x03000000u,0x05000000u,0x08000001u,
+      0x06000000u|608u|(3168u<<12),0x07000000u|16u|(240u<<10)})modern.writeGP1(command);
+  captureSceneBeforeBounds(&ctx);prepareMeshReplay(&ctx);
+  const auto snapshot=latestSceneSnapshot();ASSERT_TRUE(snapshot);
+  modern.processLinkedList(table+256*4,memory.ramPtr(),&memory);
+  // A subsequent UI-only ordering table must retain the same camera, not a
+  // zero/default camera just because that table has no model source recovery.
+  memory.write32(0x80140000,0xffffff);
+  modern.processLinkedList(0x80140000,memory.ramPtr(),&memory);
+  modern.snapshotDisplayBuffer(6138);const auto frame=modern.tryConsumeReplay();ASSERT_TRUE(frame);
+  EXPECT_TRUE(frame->latch().mgsPresentationObserved);
+  ASSERT_TRUE(frame->latch().mgsCinemaView);const auto &view=*frame->latch().mgsCinemaView;
+  EXPECT_EQ(view.actor,actor&0x1fffff);EXPECT_EQ(view.sceneEpoch,snapshot->epoch);
+  EXPECT_EQ(view.sourceView,snapshot->view);EXPECT_EQ(view.projection,snapshot->projection);
+  EXPECT_FALSE(frame->latch().mgsPlayerView);
+  EXPECT_EQ(gpu::vr::mgsPresentation(frame->operations(),{},view),gpu::vr::MgsPresentation::StereoCinema);
+  gpu::DisplayScanoutPlan plan;plan.activeExtent={320,224};
+  const auto picture=[&] {return gpu::vr::CinemaPicture::capture({modern.getVRAM(),1024*512},plan);};
+  const auto retainedPicture=picture();ASSERT_FALSE(retainedPicture.pixels.empty());
+  // The actual captured failure had its last OT at6138 and no new picture at
+  //6150. These are real GPU latches, not forged actor flags or a longer timeout.
+  for(uint64_t vblank=6139;vblank<=6150;++vblank) {
+    modern.snapshotDisplayBuffer(vblank);const auto empty=modern.tryConsumeReplay();ASSERT_TRUE(empty);
+    EXPECT_FALSE(empty->latch().mgsPresentationObserved);
+    EXPECT_FALSE(empty->latch().mgsCinemaView);
+    const auto presentation=gpu::vr::mgsPresentation(empty->operations(),{},empty->latch().mgsCinemaView);
+    EXPECT_EQ(presentation,gpu::vr::MgsPresentation::Reuse);
+    EXPECT_EQ(picture(),retainedPicture);
+    EXPECT_TRUE(gpu::vr::retainCinema(presentation,empty->latch(),view,picture()==retainedPicture));
+  }
+  // An unowned native clear is observable even without another OT. Never keep
+  // old 3D geometry in front of a new flat/cleared native picture.
+  for(uint32_t command:{0x020000ffu,0u,320u|(224u<<16)})modern.writeGP0(command);
+  modern.snapshotDisplayBuffer(6151);const auto cleared=modern.tryConsumeReplay();ASSERT_TRUE(cleared);
+  EXPECT_FALSE(cleared->latch().mgsPresentationObserved);EXPECT_NE(picture(),retainedPicture);
+  EXPECT_FALSE(gpu::vr::retainCinema(gpu::vr::MgsPresentation::Reuse,cleared->latch(),view,picture()==retainedPicture));
+  // A UI-only OT can still name the live DMO while explicitly clearing its
+  // picture. That owner witness must not bypass the native clear operation.
+  modern.processLinkedList(0x80140000,memory.ramPtr(),&memory);
+  for(uint32_t command:{0x02000000u,0u,320u|(224u<<16)})modern.writeGP0(command);
+  modern.snapshotDisplayBuffer(6152);const auto ownedClear=modern.tryConsumeReplay();ASSERT_TRUE(ownedClear);
+  ASSERT_TRUE(ownedClear->latch().mgsCinemaView);EXPECT_TRUE(ownedClear->latch().mgsPresentationObserved);
+  EXPECT_EQ(ownedClear->latch().mgsCinemaView->actor,view.actor);
+  const auto clearPresentation=gpu::vr::mgsPresentation(ownedClear->operations(),{},ownedClear->latch().mgsCinemaView);
+  EXPECT_EQ(clearPresentation,gpu::vr::MgsPresentation::Reuse);
+  EXPECT_FALSE(gpu::vr::retainCinema(clearPresentation,ownedClear->latch(),view,true,ownedClear->operations()));
+  // Removing the native producer immediately removes its admission witness.
+  memory.write32(head+4,head+32);memory.write32(head+32,head);
+  modern.processLinkedList(0x80140000,memory.ramPtr(),&memory);
+  modern.snapshotDisplayBuffer(6153);const auto next=modern.tryConsumeReplay();ASSERT_TRUE(next);
+  EXPECT_FALSE(next->latch().mgsCinemaView);
+  EXPECT_TRUE(next->latch().mgsPresentationObserved);
+  EXPECT_FALSE(gpu::vr::retainCinema(gpu::vr::MgsPresentation::Reuse,next->latch(),view,true));
+}
+
+TEST_F(MgsSourceMeshTest, CinemaWaterFeedbackRequiresOwnedClearThenActualSourceThenStrips) {
+  struct Stereo {Stereo(){setMeshReplayStereo(true);}~Stereo(){setMeshReplayStereo(false);}} stereo;
+  constexpr uint32_t water=0x80140000,prims=0x80150000,head=0x800af390+3*68;
+  memory.write32(head+4,water);memory.write32(water,head);memory.write32(water+4,head+32);
+  memory.write32(head+32,water);memory.write32(water+8,0x800ddfa0);memory.write32(water+20,water+0x200);
+  for(unsigned i=0;i<sizeof("wt_view.c");++i)memory.write8(water+0x200+i,"wt_view.c"[i]);
+  memory.write32(water+56,prims);memory.write32(water+64,1);memory.write32(water+72,201);
+  // The ordinary source fixture stores its 4x4 texture at VRAM(0,0).
+  // A full framebuffer clear would overwrite it before the model draws, so
+  // place this material outside the framebuffer, as the native scene does.
+  auto bytes=fixture(false,true,true);
+  put(bytes,cache.section(AssetCache::Source).offset+178+78,768);
+  checksum(bytes);cache=AssetCache::decode(bytes);setSceneAssetCache(&cache);
+  memory.write16(tex+4,12); // indexed4 tpage at (768,0)
+  link();memory.write16(packs+26,12);
+  // The real producer places tile2 at OT255, before the source model in OT40.
+  memory.write32(table+255*4,(prims+9880)&0xffffff);
+  memory.write32(prims+9880,0x03000000|((table+254*4)&0xffffff));
+  memory.write32(prims+9884,0x60000000);memory.write32(prims+9888,0xff90ff60);
+  memory.write32(prims+9892,0x00e00140);
+  // One actual direct15 strip from the owned SPRT array, after source geometry.
+  memory.write32(table,prims&0xffffff);
+  memory.write32(prims,0x01000000|((prims+56)&0xffffff));memory.write32(prims+4,0xe1000100);
+  memory.write32(prims+56,0x04ffffff);memory.write32(prims+60,0x6454804a);
+  memory.write32(prims+64,0xff96ff60);memory.write32(prims+68,10u<<8);memory.write32(prims+72,160u|(2u<<16));
+  gpu::GPU native,modern;configureGpu(native,false);configureGpu(modern,true);
+  for(uint32_t command:{0xa0000000u,768u,1u|(4u<<16),0x11111111u,0x11111111u}) {
+    native.writeGP0(command);modern.writeGP0(command);
+  }
+  native.writeGP0(0xe6000001);modern.writeGP0(0xe6000001); // actual force-mask clear
+  captureSceneBeforeBounds(&ctx);prepareMeshReplay(&ctx);
+  const std::vector<uint8_t> before(memory.ramPtr(),memory.ramPtr()+Memory::RAM_SIZE);
+  native.processLinkedList(table+256*4,memory.ramPtr(),&memory);
+  modern.processLinkedList(table+256*4,memory.ramPtr(),&memory);
+  EXPECT_EQ(std::memcmp(native.getVRAM(),modern.getVRAM(),1024*512*sizeof(gpu::Color16)),0);
+  EXPECT_EQ(std::memcmp(before.data(),memory.ramPtr(),before.size()),0);
+  modern.snapshotDisplayBuffer(2);const auto frame=modern.tryConsumeReplay();ASSERT_TRUE(frame);
+  unsigned ownedClears=0,ownedStrips=0,sourceFaces=0;
+  for(const auto &op:frame->operations()) if(const auto *draw=std::get_if<gpu::replay::DrawPacket>(&op)) {
+    ownedClears+=draw->mgsWaterClearActor==(water&0x1fffff);
+    ownedStrips+=draw->waterEffect[0]==(water&0x1fffff);
+    sourceFaces+=gpu::vr::isSourceWorldFace(*draw);
+  }
+  ASSERT_EQ(ownedClears,1);ASSERT_EQ(ownedStrips,1);ASSERT_EQ(sourceFaces,1);
+  EXPECT_EQ(modern.getVRAM()[0].raw,0x8000); // the native clear really ran
+  EXPECT_EQ(modern.getVRAM()[768].raw,0x1111); // material survived it
+  const auto plan=gpu::vr::cinemaWaterPass(frame->operations());
+  ASSERT_TRUE(plan.valid);EXPECT_EQ(plan.actor,water&0x1fffff);EXPECT_EQ(plan.phase,200);
+  EXPECT_EQ(plan.strips,1);EXPECT_LT(plan.sceneBegin,plan.firstStrip);
+  const auto &clear=std::get<gpu::replay::DrawPacket>(frame->operations()[plan.sceneBegin-1]);
+  EXPECT_EQ(clear.mgsWaterClearActor,water&0x1fffff);
+  EXPECT_TRUE(clear.state.mask.forceMaskBit);EXPECT_EQ(clear.waterEffect[0],0);
+  const auto &strip=std::get<gpu::replay::DrawPacket>(frame->operations()[plan.firstStrip]);
+  EXPECT_EQ(strip.vertices[0].color,(gpu::replay::Rgb8{74,128,84}));
+  EXPECT_EQ(strip.state.texturePage.depth,gpu::replay::TextureDepth::Direct15);
+  std::vector<gpu::replay::Operation> operations(frame->operations().begin(),frame->operations().end());
+  std::get<gpu::replay::DrawPacket>(operations[plan.sceneBegin-1]).mgsWaterClearActor=0;
+  EXPECT_FALSE(gpu::vr::cinemaWaterPass(operations).valid); // identical black tile, unknown owner
+  operations.assign(frame->operations().begin(),frame->operations().end());
+  const auto source=std::find_if(operations.begin()+plan.sceneBegin,operations.begin()+plan.firstStrip,
+      [](const auto &op){const auto *p=std::get_if<gpu::replay::DrawPacket>(&op);return p && gpu::vr::isSourceWorldFace(*p);});
+  ASSERT_NE(source,operations.begin()+plan.firstStrip);
+  const auto laterSource=*source;operations.push_back(laterSource); // later source breaks the pass boundary
+  EXPECT_FALSE(gpu::vr::cinemaWaterPass(operations).valid);
+  operations.assign(frame->operations().begin(),frame->operations().end());
+  auto laterClear=clear;laterClear.mgsWaterClearActor=0;
+  operations.push_back(laterClear); // later native fades/clears stay after the water image
+  EXPECT_TRUE(gpu::vr::cinemaWaterPass(operations).valid);
+  // A later texture upload has no new OT. The retained source pass must keep
+  // its own wave phase/UVs, rather than acquire the next actor or VRAM state.
+  memory.write32(water+72,202);
+  for(uint32_t command:{0xa0000000u,512u|(480u<<16),2u|(1u<<16),0x12345678u}) {
+    native.writeGP0(command);modern.writeGP0(command);
+  }
+  modern.snapshotDisplayBuffer(3);const auto upload=modern.tryConsumeReplay();ASSERT_TRUE(upload);
+  EXPECT_FALSE(upload->latch().mgsPresentationObserved);
+  EXPECT_FALSE(gpu::vr::cinemaWaterPass(upload->operations()).valid);
+  const auto retained=gpu::vr::cinemaWaterPass(frame->operations());
+  EXPECT_TRUE(retained.valid);EXPECT_EQ(retained.phase,200);EXPECT_EQ(retained.strips,1);
+  EXPECT_EQ(strip.vertices[0].v,10);
+  EXPECT_EQ(std::memcmp(native.getVRAM(),modern.getVRAM(),1024*512*sizeof(gpu::Color16)),0);
+}
+
+TEST_F(MgsSourceMeshTest, CinemaHistoryFollowsNativeDisplayPageCameraUiAndTextureSnapshot) {
+  struct Stereo {Stereo(){setMeshReplayStereo(true);}~Stereo(){setMeshReplayStereo(false);}} stereo;
+  constexpr uint32_t actor=0x8015c3d8,header=0x8015c6d8,head=0x800af390+68,emptyOt=0x80140000;
+  memory.write32(head+4,actor);memory.write32(actor,head);memory.write32(actor+4,head+32);
+  memory.write32(head+32,actor);memory.write32(actor+8,0x8007c024);memory.write32(actor+20,actor+0x200);
+  for(unsigned i=0;i<sizeof("demothrd.c");++i)memory.write8(actor+0x200+i,"demothrd.c"[i]);
+  memory.write32(actor+44,402);memory.write32(actor+48,header);memory.write32(header+8,1981);
+  memory.write32(0x800adb3c,0x80000020);memory.write32(0x800ae0a0,8);
+  memory.write32(emptyOt,0xffffff);
+  link();gpu::GPU modern;configureGpu(modern,true);
+  for(uint32_t command:{0x03000000u,0x05000140u,0x08000001u,
+      0x06000000u|608u|(3168u<<12),0x07000000u|16u|(240u<<10)})modern.writeGP1(command);
+  gpu::vr::CinemaPageHistory history;
+  std::vector<gpu::Color16> vram(1024*512);
+  gpu::DisplayScanoutPlan display;
+  const auto latch=[&](uint64_t n) {
+    modern.snapshotDisplayBuffer(n);
+    gpu::GPU::DisplayState state;gpu::replay::CrashReplayFramePtr frame;
+    modern.copyDisplayVRAM(vram.data(),vram.size(),&state,&frame);
+    EXPECT_TRUE(frame);
+    display=gpu::deriveDisplayScanoutPlan(gpu::rawDisplayCrtcInput(state),gpu::DisplayAreaPolicy::Programmed);
+    if(frame)history.observe(frame,gpu::vr::mgsPresentation(frame->operations(),frame->latch().mgsPlayerView,
+        frame->latch().mgsCinemaView),vram,display);
+    return frame;
+  };
+  const auto source=[&] {
+    captureSceneBeforeBounds(&ctx);prepareMeshReplay(&ctx);
+    modern.processLinkedList(table+256*4,memory.ramPtr(),&memory);
+  };
+  const auto ui=[&](uint32_t atlas) {
+    modern.processLinkedList(emptyOt,memory.ramPtr(),&memory);
+    for(uint32_t command:{0xa0000000u,900u|(400u<<16),2u|(1u<<16),atlas,
+        0x68c8c8c8u,uint32_t(-150)&0xffffu|((uint32_t(-100)&0xffffu)<<16)})modern.writeGP0(command);
+  };
+  source();const auto first=latch(6138);ASSERT_TRUE(first);
+  ASSERT_TRUE(history.pages[0].scene);EXPECT_FALSE(history.pages[1].scene);
+  EXPECT_EQ(display.sourceByteX,640);EXPECT_EQ(history.displayed(vram,display),nullptr);
+  // A load with only a new backbuffer OT must retain the native display.
+  // An owned UI-only OT updates that page without discarding its source camera.
+  ui(0x22222222);const auto firstUi=latch(6139);ASSERT_TRUE(firstUi);
+  ASSERT_TRUE(history.pages[0].scene);EXPECT_EQ(history.pages[0].scene,first);
+  EXPECT_EQ(history.pages[0].panel,firstUi);EXPECT_EQ(history.displayed(vram,display),nullptr);
+  modern.writeGP1(0x05000000);latch(6140); // actual native page flip, no new OT
+  const auto *visible=history.displayed(vram,display);ASSERT_NE(visible,nullptr);
+  EXPECT_EQ(visible->scene,first);EXPECT_EQ(visible->panel,firstUi);
+  EXPECT_EQ(visible->nativeVram[400*1024+900].raw,0x2222);
+  // Next shot draws to the other page with a different authored projection.
+  memory.write16(channel+80,480);
+  for(uint32_t command:{0xe3000140u,0xe4000000u|639u|(223u<<10),
+      0xe5000000u|480u|(112u<<11)})modern.writeGP0(command);
+  source();const auto next=latch(6141);ASSERT_TRUE(next);
+  ASSERT_TRUE(next->latch().mgsCinemaView);EXPECT_EQ(next->latch().mgsCinemaView->projection,480);
+  ui(0x33333333);const auto nextUi=latch(6142);ASSERT_TRUE(nextUi);
+  visible=history.displayed(vram,display);ASSERT_NE(visible,nullptr);
+  EXPECT_EQ(visible->scene,first);EXPECT_EQ(visible->panel,firstUi);
+  EXPECT_EQ(visible->scene->latch().mgsCinemaView->projection,320);
+  EXPECT_EQ(vram[400*1024+900].raw,0x3333);
+  EXPECT_EQ(visible->nativeVram[400*1024+900].raw,0x2222); // old caption/CLUT remains frame-matched
+  modern.writeGP1(0x05000140);latch(6143);
+  visible=history.displayed(vram,display);ASSERT_NE(visible,nullptr);
+  EXPECT_EQ(visible->scene,next);EXPECT_EQ(visible->panel,nextUi);
+  EXPECT_EQ(visible->nativeVram[400*1024+900].raw,0x3333);
+  // An explicit native clear invalidates only the page it actually replaces.
+  for(uint32_t command:{0x020000ffu,320u,320u|(224u<<16)})modern.writeGP0(command);
+  latch(6144);EXPECT_FALSE(history.pages[1].scene);EXPECT_TRUE(history.pages[0].scene);
+  EXPECT_EQ(history.displayed(vram,display),nullptr);
+  modern.writeGP1(0x05000000);latch(6145);
+  ASSERT_NE(history.displayed(vram,display),nullptr);
+  // Ending the authenticated actor invalidates both histories even if the
+  // currently displayed pixels haven't changed (title/unknown/Codec boundary).
+  memory.write32(head+4,head+32);memory.write32(head+32,head);
+  modern.processLinkedList(emptyOt,memory.ramPtr(),&memory);latch(6146);
+  EXPECT_FALSE(history.pages[0].scene);EXPECT_FALSE(history.pages[1].scene);
+  EXPECT_EQ(history.displayed(vram,display),nullptr);
 }

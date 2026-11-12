@@ -605,6 +605,8 @@ struct DrawPacket {
   bool furnaceHeat = false; // authenticated furnace owner of wt_view
   MgsScreenEffect screenEffect{};
   MgsSurfaceEffect surfaceEffect{};
+  uint32_t mgsWaterClearActor = 0; // wt_view tile2, native OT255 scene clear
+  uint32_t mgsSubtitleActor = 0; // authenticated Jimaku primitive, original glyphs/outline
 
   bool operator==(const DrawPacket &) const = default;
 };
@@ -759,6 +761,18 @@ struct MgsPlayerView {
   bool operator==(const MgsPlayerView &) const = default;
 };
 
+enum class MgsCinemaKind : uint8_t { Scripted, Movie };
+struct MgsCinemaView {
+  MgsCinemaKind kind = MgsCinemaKind::Scripted;
+  uint32_t actor = 0;
+  NativeRect moviePicture{};
+  uint64_t sceneEpoch = 0;
+  std::array<float,16> sourceView{};
+  int32_t projection = 0;
+  bool widescreen = false;
+  bool operator==(const MgsCinemaView &) const = default;
+};
+
 // FrameLatch is terminal.  It identifies the complete ordered mutation stream
 // whose result may be presented and supplies already-decoded scanout state.
 struct FrameLatch {
@@ -780,6 +794,10 @@ struct FrameLatch {
   DisplayLatchState display;
   uint64_t mgsPhotoCapture = 0;
   std::optional<MgsPlayerView> mgsPlayerView;
+  std::optional<MgsCinemaView> mgsCinemaView;
+  // True even when an observed native OT explicitly has no cutscene owner.
+  // False means no fresh producer evidence, not that a live owner disappeared.
+  bool mgsPresentationObserved = false;
 
   bool operator==(const FrameLatch &) const = default;
 };

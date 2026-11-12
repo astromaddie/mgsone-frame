@@ -15,6 +15,7 @@ namespace {
 struct WaterActor {
   uint32_t actor, primitives, phase;
   bool furnace = false;
+  uint32_t clearMask = 0;
 };
 // These functions run on the GPU producer thread, before publishing packets.
 std::vector<WaterActor> waterActors;
@@ -23,12 +24,17 @@ struct EffectRange {
   r::MgsScreenEffect effect;
 };
 std::vector<EffectRange> effectRanges;
+std::optional<r::MgsCinemaView> cinemaView;
+struct SubtitleRange { uint32_t begin,actor; };
+std::vector<SubtitleRange> subtitleRanges;
 } // namespace
 
 void captureScreenEffects(std::span<const uint8_t> ram) {
   captureSurfaceEffects(ram);
   captureWaterEffects(ram);
   effectRanges.clear();
+  cinemaView.reset();
+  subtitleRanges.clear();
   if (!active())
     return;
   const auto valid = [&](uint32_t p, uint32_t n) {
@@ -61,6 +67,8 @@ void captureScreenEffects(std::span<const uint8_t> ram) {
     if (!valid(head, 68))
       continue;
     std::vector<EffectRange> ranges;
+    std::vector<SubtitleRange> subtitles;
+    std::vector<r::MgsCinemaView> cinemaCandidates;
     uint32_t previous = head, actor = word(head + 4);
     unsigned guard = 0;
     for (; actor != tail && actor && guard < 1024; ++guard) {
@@ -78,6 +86,26 @@ void captureScreenEffects(std::span<const uint8_t> ram) {
         effect.parameters[2][3] = sensorFrame;
         ranges.push_back({p & 0x1fffffff, stride, count, firstPart, effect});
       };
+      // STATE_DEMO alone also occurs in flat/title sequences. Require a live
+      // linked producer and its native work/header before admitting theatre.
+      if (cinematic && level == 1 && named("demothrd.c") && valid(actor,56)) {
+        const auto header=word(actor+48);
+        if(valid(header,28) && int32_t(word(actor+44))>=0 &&
+            int32_t(word(header+8))>0 && word(header+8)<1000000 &&
+            word(actor+44)<=word(header+8)) {
+          r::MgsCinemaView view;view.actor=actor & 0x1fffffff;
+          cinemaCandidates.push_back(view);
+        }
+      } else if(cinematic && level==1 && named("movie.c") && valid(actor,108)) {
+        const auto info=word(actor+32);
+        const uint32_t dimensions=word(actor+52),width=dimensions&65535u,height=dimensions>>16;
+        // movie.c uploads its decoded strips below the 24px top border.
+        // Keep a proved black caption region below, never crop embedded titles.
+        if(valid(info,8) && width==320 && height>0 && height<=160) {
+          r::MgsCinemaView view;view.kind=r::MgsCinemaKind::Movie;view.actor=actor&0x1fffffff;
+          view.moviePicture={0,24,width,height};cinemaCandidates.push_back(view);
+        }
+      }
       if (named("menuman.c") && valid(actor, 36)) {
         // radio.c helper15 emits two adjacent rolling-band SPRTs AFTER all
         // Codec artwork and BEFORE draw_radio_message in the reversed OT.
@@ -86,10 +114,38 @@ void captureScreenEffects(std::span<const uint8_t> ram) {
         const auto arena = word(actor + 32);
         if (valid(arena, 20)) {
           const auto next = word(arena), end = word(arena + 8);
+          // USA menu_jimaku_act and JimState. A named menu actor alone is
+          // insufficient: require its resident producer, native caption type,
+          // and all five original glyph/outline packets in its live arena.
+          constexpr std::array<uint32_t,10> jimakuCode{
+              0x27bdffc0,0xafb10034,0x00808821,0xafbf003c,0xafb20038,
+              0xafb00030,0x9222002b,0x00000000,0x304200fe,0x10400007};
+          bool jimaku=valid(0x8004b770,40) && valid(0x800c01d8,12);
+          for(unsigned i=0;i<jimakuCode.size() && jimaku;++i)
+            jimaku=word(0x8004b770+i*4)==jimakuCode[i];
+          const auto state=jimaku?word(0x800c01d8):0;
+          const auto xy=jimaku?word(0x800c01dc):0;
+          const auto wh=jimaku?word(0x800c01e0):0;
+          const auto type=(state>>8)&255u,height=wh>>16;
+          jimaku &= (type==0 || type==2) && (state&255u)<=1 &&
+              (wh&65535u)==256 && height>0 && height<=38 &&
+              (xy>>16)==204-height/2 && (xy&65535u)<=160;
           for (unsigned b = 0; b < 2; ++b) {
             const auto begin = word(arena + 12 + b * 4);
             if (next < begin || next > end || next - begin > 65536 ||
                 !valid(begin, next - begin)) continue;
+            if(jimaku) for(auto q=begin;q+100<=next;q+=4) {
+              constexpr std::array<std::array<int,2>,5> offsets{{{0,0},{-1,0},{1,0},{0,1},{0,-1}}};
+              bool layout=true;
+              for(unsigned i=0;i<5 && layout;++i) {
+                const auto p=q+i*20;
+                const uint32_t expected=uint16_t(int(xy&65535u)+offsets[i][0]) |
+                    (uint32_t(uint16_t(int(xy>>16)+offsets[i][1]))<<16);
+                layout=word(p)>>24==4 && word(p+4)==(i?0x64000000u:0x64808080u) &&
+                    word(p+8)==expected && word(p+12)==0x7fbc0000u && word(p+16)==wh;
+              }
+              if(layout) subtitles.push_back({(q+4)&0x1fffffffu,actor&0x1fffffffu});
+            }
             for (auto q = begin; q + 40 <= next; q += 4) {
               if (word(q) >> 24 != 4 || word(q + 20) >> 24 != 4 ||
                   word(q + 4) != 0x66181818 || word(q + 24) != 0x66181818)
@@ -234,13 +290,28 @@ void captureScreenEffects(std::span<const uint8_t> ram) {
       actor = word(actor + 4);
     }
     // Never trust a partial/cyclic list, including recycled actor memory.
-    if (actor == tail && word(tail) == previous && word(tail + 4) == 0)
+    if (actor == tail && word(tail) == previous && word(tail + 4) == 0) {
       effectRanges.insert(effectRanges.end(), ranges.begin(), ranges.end());
+      subtitleRanges.insert(subtitleRanges.end(),subtitles.begin(),subtitles.end());
+      if(cinemaCandidates.size()==1) cinemaView=cinemaCandidates.front();
+    }
   }
 }
 
+std::optional<r::MgsCinemaView> capturedCinemaView() { return cinemaView; }
+
 void bindScreenEffect(r::DrawPacket &packet, uint32_t commandAddress) {
   bindSurfaceEffect(packet, commandAddress);
+  if(active() && commandAddress!=UINT32_MAX && packet.opcode==0x64 &&
+      packet.vertexCount==4 && packet.textured && !packet.originalMesh &&
+      (packet.state.texturePage.raw&0x1ffu)==31 && !packet.state.texturePage.textureDisable &&
+      packet.state.clut.raw==0x7fbc) {
+    const auto address=commandAddress&0x1fffffffu;
+    for(const auto &range:subtitleRanges)
+      if(address>=range.begin && address<range.begin+100 && (address-range.begin)%20==0)
+        packet.mgsSubtitleActor=range.actor;
+  }
+
   if (!active() || commandAddress == UINT32_MAX || packet.vertexCount != 4 ||
       packet.state.mask.checkMaskBit || packet.originalMesh ||
       packet.originalTexture || !packet.state.blend.enabled)
@@ -381,8 +452,14 @@ void captureWaterEffects(std::span<const uint8_t> ram) {
                      (word(f + 56) & 0xffffffu) ==
                          (word(actor + 60) & 0xffffffu);
             });
+        uint32_t clearMask=0;
+        for(unsigned b=0;b<2;++b) {
+          const uint32_t tile=prims+9880+b*16;
+          if(word(tile+4)==0x60000000 && word(tile+8)==0xff90ff60 && word(tile+12)==0x00e00140)
+            clearMask|=1u<<b;
+        }
         waterActors.push_back({actor & 0x1fffffffu, prims & 0x1fffffffu,
-                               word(actor + 72) - 1u, furnace});
+                               word(actor + 72) - 1u, furnace,clearMask});
       }
     }
     previous = actor;
@@ -390,12 +467,25 @@ void captureWaterEffects(std::span<const uint8_t> ram) {
   }
 }
 void bindWaterEffect(r::DrawPacket &packet, uint32_t commandAddress) {
-  if (!active() || packet.opcode != 0x64 || packet.vertexCount != 4 ||
+  if (!active() || (packet.opcode != 0x64 && packet.opcode!=0x60) || packet.vertexCount != 4 ||
       packet.route != r::PacketRoute::Screen2D || packet.state.blend.enabled ||
       packet.state.mask.checkMaskBit || commandAddress == UINT32_MAX)
     return;
   const uint32_t address = commandAddress & 0x1fffffffu;
   for (const auto &actor : waterActors) {
+    if(packet.opcode==0x60) {
+      // wt_view.c Act appends tile2 to OT255 before the source scene. This
+      // ownership is separate from WaterRefraction so flat replay is unchanged.
+      const auto &v=packet.vertices;
+      const auto &offset=packet.state.drawOffset;
+      for(unsigned b=0;b<2;++b)
+        if((actor.clearMask&(1u<<b)) && address==actor.primitives+9884+b*16 &&
+            !packet.textured && v[0].color==r::Rgb8{} &&
+            v[0].nativeX-offset.x==-160 && v[0].nativeY-offset.y==-112 &&
+            v[1].nativeX-v[0].nativeX==320 && v[2].nativeY-v[0].nativeY==224)
+          packet.mgsWaterClearActor=actor.actor;
+      continue;
+    }
     // Four SPRT arrays follow four DR_TPAGE and two DR_PRIO packets.
     const uint32_t begin = actor.primitives + 56 + 4;
     if (address >= begin && address < begin + 4 * 122 * 20 &&

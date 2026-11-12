@@ -2,6 +2,8 @@
 layout(location = 0) in vec2 fragUv;
 layout(location = 1) in vec3 fragShade;
 layout(location = 2) flat in uint fragMaterial;
+layout(location = 3) in float fragPerspective;
+layout(location = 4) in vec4 fragFeedbackClip;
 layout(location = 0) out vec4 outColor;
 
 struct Material {
@@ -14,6 +16,7 @@ struct Material {
 layout(set = 0, binding = 0, std430) readonly buffer AssetWords { uint asset[]; };
 layout(set = 0, binding = 1, std430) readonly buffer VramWords { uint vram[]; };
 layout(set = 0, binding = 2, std430) readonly buffer Materials { Material materials[]; };
+layout(set = 0, binding = 3) uniform sampler2D cinemaEye;
 
 uint nativeWord(uint x, uint y) {
     uint address = ((y & 511u) * 1024u + (x & 1023u));
@@ -71,12 +74,25 @@ vec3 linearRgb(vec3 rgb) {
                greaterThan(rgb, vec3(0.04045)));
 }
 
+// Sampling the sRGB eye image already decodes to linear. Native modulation
+// happens in display RGB, exactly once, before the destination sRGB encode.
+vec3 displayRgb(vec3 linear) {
+    return mix(linear * 12.92, 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+               greaterThan(linear, vec3(0.0031308)));
+}
+
 void main() {
     Material m = materials[fragMaterial];
     if ((m.native.w & 256u) != 0u && !gl_FrontFacing) discard;
-    uvec2 uv = uvec2(ivec2(floor(fragUv)));
-    vec3 rgb = fragShade;
-    if (m.native.z == 1u) {
+    uvec2 uv = uvec2(ivec2(floor(fragUv / fragPerspective)));
+    vec3 rgb = fragShade / fragPerspective;
+    if (m.native.z == 5u) {
+        outColor = vec4(texture(cinemaEye, fragUv).rgb, 1.0);
+        return;
+    } else if (m.native.z == 4u) {
+        vec2 sourceUv = fragFeedbackClip.xy / fragFeedbackClip.w * 0.5 + 0.5;
+        rgb *= displayRgb(texture(cinemaEye, sourceUv).rgb);
+    } else if (m.native.z == 1u) {
         uint texel = sampleTexture(m, uv & uvec2(255));
         if (texel == 0u) discard;
         rgb *= rgb555(texel);

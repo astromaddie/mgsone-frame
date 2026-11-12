@@ -105,7 +105,7 @@ The offscreen `PS1_VR_HEADLESS_AIM_YAW` diagnostic changes facing only.
 `PS1_VR_HEADLESS_AIM_PITCH` is ignored. The down60/down85 captures rotate the
 view independently, so they can inspect the body without tilting it.
 
-Title, Codec and video use the latched native scanout on a yaw-only 2 m,
+Title and Codec use the latched native scanout on a yaw-only 2 m,
 1.9 m-wide panel. World admission requires the producer's authenticated
 `MgsPlayerView` and source geometry from its scene epoch. A source mesh alone
 isn't enough: Frame title/difficulty captures contained a source mesh at the
@@ -121,7 +121,8 @@ I also keep the world through native behind-camera, cut-in and menu-off hints.
 Those hints alone don't establish a cutscene. This is a render policy: the
 same states still keep their original native input and movement guards.
 Unknown handlers don't get that exception. DEMO, PADDEMO, pad masking,
-game-over, authored player states, STOP and disc errors keep native presentation.
+game-over, authored player states, STOP and disc errors keep native presentation
+unless the separate live cutscene producer supplies an authenticated theatre view.
 Codec always forces cinema. `capture.txt` records `source_faces` and `player_witness`
 beside admitted `world_faces`. The Frame title capture at VBlank 3200 shows
 the original dark portrait and both menu choices; the difficulty capture at
@@ -133,11 +134,137 @@ phase. Paint-only latches refresh the HUD too. Full-page opaque paint still
 uses background rejection. Its draw-page origin is independent of
 the current display page, and partially clipped primitives keep their visible
 portion. Gameplay HUD follows the live head midpoint, yaw and pitch without
-roll. Title/Codec/video panels keep their separate room anchor. Regaining
+roll. Title, Codec and theatre panels keep their separate room anchor. Regaining
 focus places the cinema panel in front again without moving the toybox or
 first-person world. Explicit recentre transfers the current first-person
 heading into the camera basis, zeros head/stick deltas and rebuilds geometry
 before drawing either eye.
+
+Scripted cinema uses a separate read-only witness. I require the live linked
+`demothrd.c` producer, `STATE_DEMO`, a loaded DMO header and the source camera
+captured with that ordering table. A title mesh or an arbitrary camera flag
+can't turn on stereo. The renderer keeps the native camera's composition inside
+the same 1.9 m-wide picture at 2 m. Its positive depth approaches 1 m behind
+the picture, with a fixed 1,500-unit depth scale. This avoids foreground objects
+crossing the caption band. The two eyes use the existing OpenXR projection
+layer; head motion never replaces the director's camera. The window and its
+0.26 m caption band share one yaw-only room anchor and recentre together.
+
+I keep the native Jimaku text and four outline sprites. The producer checks
+the USA `menu_jimaku_act` entry at `0x8004b770`, its `JimState` at `0x800c01d8`,
+the live `menuman.c` arena and the complete five-sprite allocation. The native
+caption-off setting emits no text packets. Type 1 pause/area labels stay in
+the picture; only the original baseline-204 dialogue moves below it. The text
+is drawn once, with its original glyph texture, colour and timing. No OCR or
+replacement font is involved. The owning source is
+[jimaku.c](https://github.com/FoxdieTeam/mgs_reversing/blob/217509eae471629b1a53633b816c61adfef9ed5c/source/menu/jimaku.c).
+
+For the live `movie.c` producer, I retain the original mono scanout picture.
+Its authenticated 320-pixel image starts at native Y=24; the supported picture
+height is at most 160 pixels, above the separate Jimaku region. Embedded film
+titles stay in that image. Unknown layouts keep the complete native panel.
+The picture and caption packets share the same display latch. A second UI-only
+ordering table preserves the already captured DMO camera, while an empty native
+caption submission clears the text without replacing the paused scene. Empty
+VBlank latches retain DMO geometry only while the exact visible native picture
+is unchanged. A fresh ownerless ordering table still ends theatre immediately.
+Movie decoder uploads can change the picture between menu submissions because
+that picture is read live; its surrounding native pixels must stay unchanged.
+An explicit native clear or reset ends retention too. This keeps the black
+caption band from alternating with the full native panel during strip uploads.
+`capture.txt` records `cinema`, `cinema_faces`, `cinema_actor`, `caption_packets`
+and each caption packet's `subtitle_actor` for paired native/eye verification.
+`cinema_native_same` compares the actual visible native pixels across latches.
+
+The d00a water view needs a separate eye image before its native feedback pass.
+I render the scene into an sRGB attachment for each eye, then replay the owned
+`wt_view.c` strips with their original UVs and colour. Sampling decodes sRGB;
+I return to display RGB for the native colour multiply once, then encode the
+result normally. The strips sample the physical cinema plane through that eye's
+matrix, rather than copying the final native framebuffer over both eyes.
+Credits, native letterboxing and captions stay after that pass. A dedicated
+water-clear witness identifies the producer's `tile2` at OT255; only source
+geometry after that clear and before its water strips enters the eye image.
+Unknown ownership/order or an unavailable feedback attachment keeps the full
+native panel. The images, sampler, descriptors and framebuffers are released
+with the VR renderer. Ordinary gameplay doesn't execute this extra pass.
+
+The C4 d00a check exposed the old feedback problem: its visible scene and credits
+both had a 16-pixel eye shift with zero aligned RGB difference, despite 983
+submitted source faces. C2 and C4 native VBlank-6150 scanouts were byte-identical
+(SHA-256 `c82a4237df6e2008a2395fe2b94cba8a2eeb3b61f14c9370480912e57491a267`).
+The offscreen renderer now also saves `forward-scene-left/right.ppm` before the water
+pass so the authored camera can be checked directly. `water_actor`,
+`water_strips`, `water_feedback` and `water_supported` describe the actual
+submission. The same native checkpoint/capture remains the before/after check;
+credits should keep plane disparity while geometry behind them has less.
+
+The C5 page capture showed why display selection matters: native page0 held
+an upward close-up while displayed page320 still held the dock shot. The stereo
+camera matched page0 correctly, but that shot wasn't on the native display yet.
+I now keep two bounded scripted histories, one per draw page, with their source
+camera, UI and 1MiB native texture/CLUT snapshot. Only the displayed page can be
+selected, and its visible native pixels must still match. An unseen page after
+a CPU-only load stays on the native panel. A page flip selects the matching
+observed history; an ownerless OT, context change, clear or timeline reset
+invalidates it. Movie uploads keep their separate live-picture policy.
+`cinema_display_page` reports the selected page (or -1 for native fallback),
+and `cinema_page_history` reports the observed-page bitmask. The unchanged C5
+water pass measured 11-pixel scene/stairs disparity against 16-pixel credits,
+with identical coincident eyes. Display-aligned stereo is checked after a native
+page flip, rather than treating a paused backbuffer as the displayed shot.
+
+The focused checks are `MgsVrCinema.*`, `MgsCinemaProducer.*` and
+`MgsSourceMeshTest.ScriptedCinemaLatchesAuthenticatedProducerWithItsActualSceneCamera`
+and `MgsSourceMeshTest.CinemaWaterFeedbackRequiresOwnedClearThenActualSourceThenStrips`,
+plus `MgsSourceMeshTest.CinemaHistoryFollowsNativeDisplayPageCameraUiAndTextureSnapshot`.
+They cover composition, bounded stereo depth, native glyph ownership on both
+framebuffer pages, caption-off/clear and pause-label exclusions, source-camera
+latching and title/Codec rejection. The GPU recorder tests compare native VRAM and guest RAM before and after
+capture, including the displayed page, camera, UI and texture snapshot.
+
+I checked the retail d00a opening on the Frame from a native VBlank-6100
+checkpoint. At VBlank 6150 the renderer selected displayed page 320 with 907
+source faces and projection 397. The native scanout stayed byte-identical to the
+baseline. Coincident eye images matched exactly. The scene and stairs matched
+between separated eyes at an 11-pixel shift, while the credits stayed at the
+16-pixel screen plane. A normal-paced continuation to VBlank 6400 selected the
+matching page-320 shot with 667 faces and projection 200; its coincident eyes
+also matched. This covers the director's framing and real depth behind the
+picture. The sampled opening has credits; dialogue glyph ownership and band
+placement are covered by the focused tests. Movie strip uploads have their own
+GPU-path check.
+
+To repeat the opening check, use an isolated runtime config and card copies.
+Point it at the imported USA v1.0 media and keep its savestates outside the
+ordinary profile:
+
+```sh
+SDL_AUDIODRIVER=dummy PS1_DIAGNOSTIC_HEADLESS=1 \
+PS1_MEMORY_CARD_DIR="$profile/cards" \
+PS1_DIAGNOSTIC_SAVESTATE_DIR="$profile/savestates" \
+PS1_INPUT_SCRIPT=config/mgs-usa-gameplay.input \
+PS1_VBLANK_PERIOD_US=1000 PS1_AUTOSAVE_VBLANK=6100 \
+PS1_EXIT_AFTER_AUTOSAVE=1 "$runtime" --config "$profile/runtime.toml"
+
+SDL_AUDIODRIVER=dummy PS1_MGS_MESH_REPLAY=1 \
+PS1_MGS_ASSET_CACHE="$media/assets.mgsc" \
+PS1RECOMP_VULKAN_SHADER_DIR="$shaders" \
+PS1_MEMORY_CARD_DIR="$profile/cards" \
+PS1_DIAGNOSTIC_SAVESTATE_DIR="$profile/savestates" \
+PS1_INPUT_SCRIPT=config/mgs-usa-gameplay.input \
+PS1_AUTOLOAD_VBLANK=1 PS1_VBLANK_PERIOD_US=16667 \
+PS1_VR_CAPTURE_VBLANK=6400 PS1_EXIT_VBLANK=6500 \
+PS1_NATIVE_DISPLAY_DUMP_DIRECTORY="$capture/native" \
+PS1_NATIVE_DISPLAY_DUMP_FROM=6398 PS1_NATIVE_DISPLAY_DUMP_TO=6402 \
+PS1_NATIVE_DISPLAY_DUMP_STEP=1 \
+"$runtime" --config "$profile/runtime.toml" --vr-headless "$capture/eyes"
+```
+
+Keep `PS1_VR_HEADLESS_RENDER_HZ` unset for image captures. Check the actual
+VBlank in `capture.txt`, match its native image, and require the selected
+`cinema_display_page` to match the native scanout. An unseen page should keep
+the complete native picture until a matching source has been observed.
 
 `[MGS VR] Panel placement` logs once on focus, presentation-context changes
 and explicit recentre. Its reason bits are 1/2/4 respectively. It records the

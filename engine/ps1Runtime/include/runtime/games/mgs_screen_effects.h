@@ -25,6 +25,7 @@ void bindWaterEffect(gpu::replay::DrawPacket &packet, uint32_t commandAddress);
 // Snapshot read-only actor ownership at each ordering-table submission. No
 // pointers into RAM survive the producer queue or savestate restoration.
 void captureScreenEffects(std::span<const uint8_t> ram);
+std::optional<gpu::replay::MgsCinemaView> capturedCinemaView();
 void bindScreenEffect(gpu::replay::DrawPacket &packet, uint32_t commandAddress);
 
 // A snapshot can serve successive strips only while none of their source
