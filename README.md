@@ -1,236 +1,178 @@
-<p align="center">
-  <img src="docs/images/mgsone-header.png" alt="Midnight Ghost Stone" width="100%">
-</p>
+# MGSOne VR for Steam Frame
 
-# Midnight Ghost Stone
+A native ARM64 Steam Frame port of *Metal Gear Solid* for PlayStation, with
+stereo rendering, head tracking and two ways to play in VR. It runs on the
+headset without a streaming PC.
 
-A native PC recompilation of *Metal Gear Solid* for PlayStation, with a modern
-Vulkan presentation built around the original game assets. Repository:
-**mgsone-recomp**.
+This is my VR fork of
+[coccofresco/mgsone-recomp](https://github.com/coccofresco/mgsone-recomp).
+The original game logic and assets sit underneath a Vulkan renderer and
+OpenXR presentation.
 
-> **AI-MADE PROJECT.** MGSOne-specific development is **AI-generated, under
-> human direction**. The donor projects, third-party libraries and original
-> game are the work of their respective creators; this label applies to the
-> project-specific work built on those foundations.
+## What It Does
 
-## Credit Where It Belongs
+| View | Behaviour |
+| --- | --- |
+| Third Person | A fixed, tilted toybox diorama. Movement follows the diorama's orientation, even when the original game camera changes. |
+| First Person | A head-tracked camera attached to Snake, with his body, arms and weapon visible. Movement follows your horizontal head direction; the right stick turns Snake. |
+| Scripted Cutscenes | A fixed cinema screen with stereo depth behind the picture and native subtitles below it. |
+| Prerecorded Video | The original mono picture on a cinema screen. |
+| Menus and Codec | The complete original panel. Gameplay HUD, radar and item selectors stay over the game view. |
 
-Before the shaders, bubbles and increasingly elaborate surveillance cameras:
-**this project builds on a tremendous amount of work by other people**.
+Arms and weapons use their original animations and aiming, including
+autotarget. Tracked-controller aiming and arm IK are disabled.
 
-- **[FoxdieTeam / mgs_reversing](https://github.com/FoxdieTeam/mgs_reversing)**
-  provides the decompilation research behind our understanding of the game,
-  its actors, scripts and graphics. The imported texture module is attributed
-  separately in the source and notices.
-- **[PS1Recomp](https://github.com/Dellareti/ps1-recomp)** is the engine
-  foundation, inherited through the local Crash Bandicoot 3 recompilation.
-  **[SwanStation](https://github.com/libretro/swanstation)** is our instrumented
-  donor and reference for checking original behavior.
-- **[Rex](https://github.com/Jayveer/Rex)**,
-  **[MGS-KMD-Noesis](https://github.com/Jayveer/MGS-KMD-Noesis)** and
-  **[mint](https://github.com/virusek20/mint)** helped make the original formats
-  understandable. **[PSXRecomp](https://github.com/RetroPortingToolKit/psxrecomp)**,
-  **[RecompOne](https://github.com/BlackLabelHQ/RecompOne)** and
-  **[Alexbeav's MGS recomp](https://github.com/Alexbeav/metal-gear-solid-recomp)**
-  are additional research references, with reuse recorded in the documentation.
-- **Godot / Intel ASSAO, N8AO, SDL, Dear ImGui** and the controller-mapping
-  community supply important rendering and interface foundations.
+## Before You Start
 
-And, of course, **Konami and the original Metal Gear Solid team**, who made
-the game worth doing all this for.
-[Credits, provenance and license scope](packaging/THIRD_PARTY_NOTICES.md).
+This is an experimental source release. There isn't a ready-to-install
+Steam Frame download in this repository yet. The upstream Windows and x86-64
+Linux packages are separate desktop builds.
 
-> **[alpha.1 — UNTESTED](https://github.com/coccofresco/mgsone-recomp/releases/tag/alpha.1)**
-> Experimental Linux and Windows builds, published for early testing.
-> These release packages are not gameplay- or platform-qualified. A continuous
-> completed campaign, every boss fight and physical Steam Deck compatibility
-> have not been certified. Keep backups and ordinary in-game Codec saves.
+You'll need:
 
-## About
+- A Steam Frame with SteamVR/OpenXR and Vulkan support.
+- Your own **USA v1.0** copies of both discs: **SLUS-00594** and **SLUS-00776**.
+- An ARM64 Linux build environment, or an x86-64 Windows/WSL cross-build setup.
 
-Midnight Ghost Stone follows the same general idea as the modern recomp
-projects: let the game run natively, then give its presentation room to breathe.
-I wanted to play Metal Gear Solid again. Naturally, this turned into a project
-about water refraction, Codec screens and whether a cardboard box needs
-ambient occlusion.
+The importer accepts raw BIN images or single-track MODE2/2352 CUE/BIN pairs.
+Extract archives first. **USA v1.1 / Rev 1, other regions and Integral aren't
+supported.** The executable patches and overlay addresses target v1.0.
 
-The visual goal is **a modern rendering of the original image**, with its
-atmosphere and visual identity intact. Vulkan can use original meshes,
-floating-point animation, per-pixel lighting and modern effects without
-recreating the PlayStation's drawing method. Underneath, gameplay keeps its
-original timing and behavior. Changes to the presentation are documented so
-that a nicer-looking effect cannot quietly become an unexplained regression.
+No BIOS download is required. Disc images, extracted assets, saves and
+generated game translations stay local and aren't included here.
 
-Most game logic currently uses **static MIPS-to-native recompilation**.
-Selected decompiled C routines replace it where they have been adapted and
-checked against the USA executable. This is an ongoing migration, not a claim
-that the entire game has already been rewritten in clean C.
+## Build
 
-**The project-specific work is AI-made, under human direction.**
-That describes the project-specific work, not the mature donor projects and
-libraries above. As with [TriAevum](https://github.com/coccofresco/TriAevum),
-there is a fair amount of concentrated AI slop here. The regression tests are
-an attempt to make it accountable.
+### ARM64 Linux
 
-## Install and build
+The simplest build path uses ARM64 Linux, including the Frame itself if its
+development tools are already installed. You'll need Git, Python 3.11+, CMake
+3.20+, Ninja, Clang with C++20 support, SDL2 2.26+, Vulkan development files
+and `glslc`. CMake fetches the pinned OpenXR SDK.
 
-The current game target is **USA v1.0**, both discs:
-**SLUS-00594** and **SLUS-00776**. You need your own original BIN images or
-single-track MODE2/2352 CUE/BIN pairs. Other regions, Integral and modified
-images are not currently supported by the native game build. No BIOS download
-is required. Discs, extracted assets and generated game translations are
-prepared locally and are excluded from this repository.
-
-### Download alpha.1 — UNTESTED
-
-Choose your package from the
-**[alpha.1 prerelease](https://github.com/coccofresco/mgsone-recomp/releases/tag/alpha.1)**:
-
-| Platform | Download | Start |
-| --- | --- | --- |
-| Linux / SteamOS x86_64 | [AppImage](https://github.com/coccofresco/mgsone-recomp/releases/download/alpha.1/mgsone-recomp-alpha.1-linux-x86_64.AppImage) | Make executable, then open it |
-| Linux / SteamOS x86_64 | [Flatpak](https://github.com/coccofresco/mgsone-recomp/releases/download/alpha.1/mgsone-recomp-alpha.1-linux-x86_64.flatpak) | Install the bundle, then open MGS Recomp |
-| Windows x64 | [ZIP](https://github.com/coccofresco/mgsone-recomp/releases/download/alpha.1/mgsone-recomp-alpha.1-windows-x86_64.zip) | Extract the entire ZIP, then run MGSRecomp.exe |
-
-In the launcher, import both original USA v1.0 discs and choose **PLAY**.
-No compiler or separate Python installation is needed for these packages.
-The release includes **SHA256SUMS** and matching source archives. GitHub's
-automatically generated source archives are not playable packages.
-
-On SteamOS, install in Desktop Mode, add the application as a non-Steam game
-and use Steam Input's **Gamepad** layout with launch option `--big-picture`.
-These are experimental packages, not a Deck Verified claim. See the
-[installation guide](docs/mgs-alpha-install.md) for requirements and data paths.
-
-### Linux development build
-
-Requires Python 3.11+, CMake 3.20+, Ninja, a C++20 compiler, SDL 2.26+, Vulkan
-development files, `glslc`, and a working Vulkan GPU driver. On Ubuntu 24.04,
-the build packages are:
+On ARM64 Ubuntu, install the dependencies with:
 
 ```sh
-sudo apt-get install git cmake ninja-build g++ libsdl2-dev libvulkan-dev glslc python3
-git clone https://github.com/coccofresco/mgsone-recomp.git
-cd mgsone-recomp
-bash scripts/build_alpha.sh '/path/to/disc1.cue' '/path/to/disc2.cue'
-python3 scripts/mgs_alpha.py --user-dir "$PWD/data/alpha-build"
+sudo apt-get update
+sudo apt-get install git cmake ninja-build clang g++ libsdl2-dev libvulkan-dev glslc python3
 ```
 
-This verifies and imports both discs, generates the native game code, builds
-the runtime and runs its tests. The last command opens the launcher using
-that same imported profile. Compilation of the generated game code can take
-time and substantial memory; `BUILD_JOBS=2` reduces build parallelism.
+Then clone and build:
 
-The dependencies under `engine/third_party` are included; no local donor
-checkout or recursive submodule clone is needed for this build.
+```sh
+git clone https://github.com/astromaddie/mgsone-frame.git
+cd mgsone-frame
+BUILD_JOBS=2 bash scripts/build_alpha.sh --steam-frame \
+  '/path/to/disc1.cue' '/path/to/disc2.cue'
+```
 
-See the [Steam Frame build notes](docs/STEAM_FRAME.md) for the ARM64 baseline.
+The build verifies both discs, prepares the local asset cache, generates the
+native game translation and builds the runtime. It also runs the controller,
+runtime and Python checks. Keep the whole checkout together after building;
+the launcher uses its runtime, shaders and scripts.
 
-### Windows, SteamOS and portable packages
+See [Steam Frame Setup](docs/STEAM_FRAME.md) for the full build details.
 
-Windows x64 uses the same game and renderer sources. The current build path
-cross-compiles from Linux using pinned dependencies; see
-[Windows build and validation](docs/mgs-windows.md).
-The existing Windows validation ran the real PE executables through Wine on
-a physical Vulkan GPU. Testing on native Windows hardware remains necessary.
+### Windows / WSL
 
-Linux packaging targets **AppImage and Flatpak**, with a controller-navigable
-launcher for desktop use and Steam Big Picture. Steam Input uses the standard
-Gamepad layout. Physical Deck, controller transport and suspend/resume testing
-remain on the acceptance list. See
-[installation and settings](docs/mgs-alpha-install.md),
-[SteamOS packaging](docs/mgs-steamos.md) and
-[controller compatibility](docs/mgs-controllers.md).
-The downloadable alpha.1 packages retain the **UNTESTED** qualification;
-earlier development checks do not certify these release artifacts.
+The [Windows Cross-Build Guide](docs/MGS_WINDOWS_FRAME_DEV.md) describes the
+D:-backed WSL setup used for development. It uses native x86-64 host tools
+and cross-compiles the runtime for ARM64 against a Frame sysroot. Its workspace
+paths describe that development setup; the ARM64 recipe above doesn't require
+that layout.
 
-Keep ordinary **in-game Codec saves** as well as quick states. Alpha savestate
-compatibility can change between builds. The launcher separates application
-files from user data and provides explicit save backups and diagnostic exports.
+On Apple Silicon, use ARM64 Linux in a VM or on a remote host. This is a Linux
+OpenXR port, not a native macOS VR application.
 
-## Graphics and controls
+## Launch on the Frame
 
-- Original **KMD/ZMD meshes, PCX textures and animated poses** feed the Vulkan
-  presentation, with a resident asset cache prepared from both discs.
-- **True 4K output** by default, selectable lower resolutions and fixed **16:9**
-  framing that does not stretch with the window.
-- Floating-point geometry and articulated poses, per-pixel lighting and modern
-  color precision. Original low-resolution rendering remains a separate
-  reference for development checks.
-- Ambient occlusion adapted from **Godot / Intel ASSAO**, with a
-  distance-dependent radius informed by **N8AO**.
-- Modern water, depth fog, bubbles, particles, screen effects and temporal
-  trails. Surveillance and Codec effects reconstruct a simulated **CRT / RGB
-  phosphor image**, keeping subtitles readable outside the effect.
-- Experimental **60 FPS presentation interpolation** between original game
-  states. The game retains its original 30/20 Hz logic; this does not turn
-  gameplay into 60 Hz physics. Currently opt-in through the developer runtime
-  (`PS1_MGS_FRAME_INTERPOLATION=1` with `scripts/run_native.sh`), not a launcher
-  setting. [Implementation and measured evidence](docs/mgs-frame-interpolation-evidence.json).
-- Fast loading, **automatic disc 1 → disc 2 change**, persistent memory cards,
-  quick-state slots, a host pause menu and controller-port switching.
-- Keyboard and SDL controllers, Steam Input integration, device selection,
-  deadzone settings and an input test screen.
+Copy the built checkout to the Frame if you built elsewhere. If you haven't
+imported the discs on the Frame yet, run this from that checkout first:
 
-The original textures are still the original textures. Rendering them at 4K
-does not invent detail they never contained. Effects and resolution also cost
-GPU time; choose settings that suit your hardware.
+```sh
+scripts/launch_steam_frame.sh import '/path/to/disc1.cue' '/path/to/disc2.cue'
+```
 
-| Action | Default control |
+This creates the Frame profile described below. An existing verified import
+can be reused.
+
+1. In Steam's Desktop Mode, add `scripts/launch_steam_frame.sh` from the
+   checkout as a **Non-Steam Game**.
+2. Set **Start In** to the checkout directory.
+3. Launch it from Steam. With no arguments, the launcher opens VR directly.
+
+Launch through Steam so the Frame controllers are available. `--vr` selects
+VR explicitly; `--flat` starts the desktop version.
+
+## Controls
+
+| Input | Action |
 | --- | --- |
-| Move | Arrow keys / D-pad / left stick |
-| Cross / Circle / Square / Triangle | Z / X / A / S |
-| L1 / R1 / L2 / R2 | Q / W / E / R |
-| Start / Select | Enter / Backspace |
-| Host pause menu | Esc / right-stick click (R3) |
-| Save / load quick state | F5 / F9 |
-| Previous / next state slot | F6 / F7 |
-| Toggle fullscreen | F11 |
+| Left Stick / D-Pad | Move Snake; navigate native menus |
+| Right Stick | Turn Snake in first person |
+| Right-Stick Click | Switch between first person and the diorama |
+| A / B / X / Y | Original Cross / Circle / Square / Triangle buttons |
+| Left / Right Bumper | Original L1 / R1 buttons |
+| Left Trigger | Original L2 item selector |
+| Right Trigger, Third Person | Original R2 weapon selector |
+| Right Trigger, First Person | Fire |
+| Right Grip, First Person | Open the weapon selector |
+| Menu | Original Start button |
+| View, Tap | Original Select / Codec |
+| View, Hold | Recentre the view |
 
-## Testing and contributing
+In first person, looking up or down changes the camera, not the gun's aim.
+The original item and weapon selectors keep their normal navigation.
 
-The useful question is not just whether the intro looks nice, although I have
-spent an unreasonable amount of time on that. It is whether the game behaves
-correctly when a door opens, a cutscene finishes, a card is saved or the second
-disc takes over.
+## Saves and Settings
 
-Checks cover independent scenarios on **both discs**, mandatory transitions,
-death and Continue, torture branches, PAL terminals, prepared REX/Liquid phase
-exits, both endings, credits and the final save. Native behavior is compared
-with the instrumented donor. Some tests deliberately prepare a particular
-state: they prove that transition, not the entire fight leading up to it.
-Actual Vulkan GPU checks are recorded separately from headless runtime tests.
+VR and flat mode share the same profile:
 
-Full fights, jeep combat and a continuous start-to-finish playthrough still
-need work. People willing to play, investigate and report reproducible
-problems are especially welcome. See the
-[gameplay coverage and open cases](docs/mgs-completion.md),
-[mandatory-path checks](docs/mgs-required-paths.md) and
-[original-asset GPU validation](docs/mgs-asset-presentation-validation.md).
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/mgs-recomp-frame/
+├── library/       Verified disc import and asset cache
+├── memory_cards/  Original in-game saves
+├── savestates/    Quick states
+└── config/        Launcher settings
+```
 
-Please [report issues](https://github.com/coccofresco/mgsone-recomp/issues)
-with the commit/build, OS, GPU and driver, selected settings, disc, difficulty,
-location and exact steps to reproduce. Mention whether the session came from
-an in-game save or a quick state. Screenshots and inspected diagnostic exports
-help. Do not attach discs, extracted assets or full memory savestates to public
-issues. Contributions and forks are welcome; include a reproducible check for
-the behavior being changed.
+Keep normal in-game Codec saves as well as quick states. Quick-state
+compatibility can change between builds. Back up the profile before updating.
+Changing or removing the checkout doesn't remove this profile.
 
-Public CI builds the launcher, shaders and source-only tests without game
-data. That checks the published source; it is not a substitute for the private
-retail-input or physical-GPU validation. Developer details are in the
-[runtime progress log](docs/mgs-runtime-progress.md) and
-[presentation contract](docs/mgs-vulkan-presentation.md).
+## Status and Bug Reports
 
-## Source and license
+The latest recorded Frame checks passed **39 VR tests** and **1,373 runtime
+tests**, with **32 optional skips**. Offscreen captures checked cinema depth,
+native camera composition and identical images for coincident eyes. These
+checks cover specific scenes and behaviours, not a complete campaign.
 
-The engine uses **GPL-3.0**; see [LICENSE](LICENSE). Third-party code retains
-its own notices and terms. The attributed FoxdieTeam texture adaptation is
-documented separately; the engine license does not assign a new license to
-that upstream work. See the [full notices](packaging/THIRD_PARTY_NOTICES.md)
-and [engine provenance](docs/engine-provenance.json).
+The [VR Notes](docs/VR_ARCHITECTURE.md) record the implementation and
+repeatable checks. [Playback Notes](docs/FRAME_PLAYBACK.md) cover timing and
+audio work. [Public Source Checks](docs/PUBLIC_SOURCE.md) describe the publication
+boundary.
 
-This is an independent, unofficial project, not affiliated with or endorsed
-by Konami. Metal Gear Solid and its assets belong to their respective owners.
+Please [report problems](https://github.com/astromaddie/mgsone-frame/issues)
+with the commit, disc version, location, selected VR view and steps to
+reproduce. Mention whether you loaded an in-game save or a quick state.
+Screenshots help. Don't upload discs, extracted assets, memory cards or full
+savestates to public issues.
 
-At least the cardboard box has somewhere modern to hide.
+## Credits and Licensing
+
+The Frame port builds on
+[Midnight Ghost Stone / mgsone-recomp](https://github.com/coccofresco/mgsone-recomp)
+and its Vulkan presentation. The runtime comes from
+[PS1Recomp](https://github.com/Dellareti/ps1-recomp).
+[FoxdieTeam's reversing work](https://github.com/FoxdieTeam/mgs_reversing)
+provides game research and the separately attributed texture adaptation.
+The original game is the work of Konami and the Metal Gear Solid team.
+
+The engine is GPL-3.0; see [LICENSE](LICENSE). Dependencies and adapted code
+retain their own terms. The inherited FoxdieTeam texture adaptation has a
+separate provenance and licensing limitation, documented in the
+[Third-Party Notices](packaging/THIRD_PARTY_NOTICES.md); the engine's licence
+doesn't grant a new licence to that code.
+
+This is an unofficial project, with no affiliation with or endorsement from
+Konami. Metal Gear Solid and its assets belong to their respective owners.
